@@ -1,0 +1,20 @@
+.git
+.runtime
+.venv
+__pycache__
+*.pyc
+backend/data/
+backend/__pycache__/
+ffuf*.json
+amass_*.txt
+*.log
+*.tar
+*.tar.gz
+blobs/
+index.json
+manifest.json
+oci-layout
+repositories
+recovered-app/
+backend/main - backup 1.py
+backend/main - backup 2.py

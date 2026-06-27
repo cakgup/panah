@@ -1,0 +1,21 @@
+services:
+  redteam-console:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: redteam-console
+    restart: unless-stopped
+    ports:
+      - "4080:4080"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./backend/data:/app/backend/data
+      - ./lab-ranges.json:/app/lab-ranges.json
+      - ./index.html:/app/index.html
+      - ./script.js:/app/script.js
+      - ./styles.css:/app/styles.css
+      - ./logo.png:/app/logo.png
+    environment:
+      TZ: Asia/Jakarta
