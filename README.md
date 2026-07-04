@@ -162,7 +162,7 @@ http://IP_SERVER_KALI:4080
 Contoh:
 
 ```text
-http://10.100.244.87:4080
+http://localhost:4080
 ```
 
 ---
