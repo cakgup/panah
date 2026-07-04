@@ -3,24 +3,27 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Authorized Lab Emulation Console</title>
-  <meta name="description" content="Starter dashboard untuk Kali Linux WSL dengan backend FastAPI, guardrail target, dan simulation-only job runner.">
+  <title>PANAH</title>
+  <meta name="description" content="PANAH - Pentest Automation and Network Assessment Hub.">
   <meta name="theme-color" content="#1e4f91">
-  <link rel="stylesheet" href="styles.css?v=20260626-layout-fix">
+  <link rel="stylesheet" href="styles.css?v=20260703-panah-header-sync">
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand-block">
-        <img class="brand-mark" src="/static/logo.png" alt="cakgup logo">
+        <img class="brand-mark" src="/static/logo.png" alt="Logo Direktorat SITP">
         <div>
-          <h1>Authorized Lab Emulation Console</h1>
-          <p>Internal use only | Developed by Seksi PJKI</p>
+          <h1>PANAH</h1>
+          <p>Pentest Automation and Network Assessment Hub</p>
         </div>
       </div>
 
       <div class="topbar-meta">
-        <button class="theme-button" id="themeToggle" type="button" aria-label="Ubah tema">◐</button>
+        <button class="ghost-button topbar-action-button" id="logoutBtn" type="button">Logout</button>
+        <button class="theme-button" id="themeToggle" type="button" aria-label="Ubah tema">
+          <span class="theme-icon" aria-hidden="true"></span>
+        </button>
       </div>
     </header>
 
@@ -28,8 +31,15 @@
       <section class="hero-card">
         <div class="hero-fields">
           <label class="field">
-            <span>Target IP</span>
+            <span>Target</span>
             <input id="targetInput" type="text" value="10.10.10.20" spellcheck="false" autocomplete="off">
+          </label>
+          <label class="field profile-field">
+            <span>Target Kind</span>
+            <select id="targetKindSelect">
+              <option value="ip" selected>ip</option>
+              <option value="url">url</option>
+            </select>
           </label>
           <label class="field profile-field">
             <span>Module Profile</span>
@@ -42,43 +52,82 @@
         </div>
 
         <div class="hero-actions">
-          <div class="view-switch" id="viewSwitch" aria-label="Pilih mode tampilan">
-            <button class="view-switch-button" id="playbookViewBtn" type="button">Playbook View</button>
-            <button class="view-switch-button" id="detailViewBtn" type="button">Detail View</button>
-          </div>
-          <button class="ghost-button" id="refreshModulesBtn" type="button">Refresh Modul</button>
           <button class="primary-button" id="runChainBtn" type="button">Run Full Simulation Chain</button>
+          <p class="run-chain-status-note" id="runChainStatusNote" aria-live="polite">Siap menjalankan full chain untuk target aktif.</p>
         </div>
       </section>
 
-      <section class="config-card">
-        <div class="config-card-head">
+      <section class="workflow-guide-card">
+        <div class="workflow-guide-step" id="workflowStepTarget" data-workflow-step="target">
+          <span>1</span>
           <div>
-            <p class="eyebrow">Range Editor</p>
-            <h3>Approved Ranges</h3>
+            <strong>Tentukan target</strong>
+            <small>Pilih target, jenis target, dan kedalaman eksekusi sesuai scope.</small>
           </div>
-          <small id="configMetaLabel">Memuat sumber konfigurasi...</small>
         </div>
-        <label class="field config-inline-field">
-          <span>Subnet CIDR</span>
-          <input id="allowedSubnetsInput" type="text" spellcheck="false" placeholder="10.10.10.0/24, 192.168.56.0/24">
-        </label>
-        <div class="config-card-actions">
-          <button class="ghost-button" id="reloadConfigBtn" type="button">Reload Config</button>
-          <button class="primary-button" id="saveRangesBtn" type="button">Simpan Ranges</button>
+        <div class="workflow-guide-step" id="workflowStepAssessment" data-workflow-step="assessment">
+          <span>2</span>
+          <div>
+            <strong>Jalankan assessment</strong>
+            <small>Buat assessment bila perlu tracking, lalu jalankan chain atau modul.</small>
+          </div>
+        </div>
+        <div class="workflow-guide-step" id="workflowStepReview" data-workflow-step="review">
+          <span>3</span>
+          <div>
+            <strong>Review hasil utama</strong>
+            <small>Mulai dari recent jobs, live console, lalu evidence.</small>
+          </div>
         </div>
       </section>
+
+      <details class="config-card config-disclosure">
+        <summary class="config-summary">
+          <div>
+            <p class="eyebrow">Advanced Settings</p>
+            <h3>Approved Ranges</h3>
+          </div>
+          <small>Jarang dipakai saat eksekusi harian.</small>
+        </summary>
+        <div class="config-card-body">
+          <div class="config-card-head">
+            <small id="configMetaLabel">Memuat sumber konfigurasi...</small>
+          </div>
+          <div class="hero-fields">
+            <label class="field">
+              <span>Operator</span>
+              <input id="operatorNameInput" type="text" value="cakgup" spellcheck="false" autocomplete="off">
+            </label>
+            <label class="field">
+              <span>Ticket Ref</span>
+              <input id="ticketRefInput" type="text" placeholder="RT-2026-001" spellcheck="false" autocomplete="off">
+            </label>
+          </div>
+          <label class="field config-inline-field">
+            <span>Subnet CIDR</span>
+            <input id="allowedSubnetsInput" type="text" spellcheck="false" placeholder="10.10.10.0/24, 192.168.56.0/24">
+          </label>
+          <div class="config-card-actions">
+            <button class="ghost-button" id="reloadConfigBtn" type="button">Reload Config</button>
+            <button class="primary-button" id="saveRangesBtn" type="button">Simpan Ranges</button>
+          </div>
+        </div>
+      </details>
 
       <section class="content-grid">
         <div class="module-pane">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">Module Catalog</p>
-              <h2>Modul Cyber Kill Chain</h2>
+              <p class="eyebrow" id="catalogEyebrow">Module Catalog</p>
+              <h2 id="catalogTitle">Modul Cyber Kill Chain</h2>
+              <small class="section-note" id="viewModeNote">Mode detail menampilkan deskripsi, command preview, toolset, dan konteks modul yang lengkap.</small>
             </div>
-            <label class="catalog-search" aria-label="Cari modul">
-              <input id="moduleSearchInput" type="text" placeholder="Cari modul, tool, MITRE, risk...">
-            </label>
+            <div class="catalog-controls">
+              <button class="ghost-button" id="openToolCatalogBtn" type="button">Tool Catalog</button>
+              <label class="catalog-search" aria-label="Cari modul">
+                <input id="moduleSearchInput" type="text" placeholder="Cari modul, tool, MITRE, risk...">
+              </label>
+            </div>
           </div>
 
           <div class="phase-tabs" id="phaseTabs"></div>
@@ -92,11 +141,18 @@
             <strong id="statusLabel">idle</strong>
           </div>
 
+          <div class="history-card hidden" id="approvalQueueCard">
+            <div class="console-card-head">
+              <h3>Approval Queue</h3>
+              <span id="approvalQueueLabel">0 pending</span>
+            </div>
+            <div class="evidence-list" id="approvalQueueList">Belum ada modul approval yang pending.</div>
+          </div>
+
           <div class="history-card">
             <div class="console-card-head">
               <h3>Recent Jobs</h3>
               <div class="history-actions">
-                <button class="ghost-button compact" id="refreshJobsBtn" type="button">Refresh</button>
                 <button class="ghost-button compact" id="stopAllJobsBtn" type="button">Stop Semua</button>
                 <button class="ghost-button compact" id="clearJobsBtn" type="button">Hapus Semua</button>
               </div>
@@ -108,6 +164,8 @@
             <div class="progress-card-head">
               <strong id="jobProgressValue">0%</strong>
               <div class="export-actions">
+                <button class="ghost-button compact" id="viewJobEvidenceBtn" type="button" disabled>Evidence JSON</button>
+                <button class="ghost-button compact" id="viewJobMarkdownBtn" type="button" disabled>Report MD</button>
                 <button class="ghost-button compact" id="viewHtmlBtn" type="button" disabled>View Report</button>
               </div>
             </div>
@@ -121,7 +179,6 @@
             <div class="console-card-head">
               <div class="panel-tabs" id="insightTabs">
                 <button class="panel-tab is-active" data-insight-tab="console" type="button">Console</button>
-                <button class="panel-tab" data-insight-tab="timeline" type="button">Timeline</button>
                 <button class="panel-tab" data-insight-tab="evidence" type="button">Evidence</button>
               </div>
             </div>
@@ -134,26 +191,162 @@
                 </div>
                 <span id="activeJobLabel">No job selected</span>
               </div>
-              <pre id="consoleOutput">Memuat konfigurasi backend...</pre>
-            </div>
-
-            <div class="insight-panel hidden" data-insight-panel="timeline">
-              <div class="console-card-head">
-                <h3>Module Timeline</h3>
-                <span id="timelineCountLabel">0 phases</span>
+              <section class="terminal-shell" id="interactiveTerminalShell">
+                <div class="terminal-toolbar">
+                  <div class="terminal-dots" aria-hidden="true">
+                    <span class="terminal-dot terminal-dot-close"></span>
+                    <span class="terminal-dot terminal-dot-min"></span>
+                    <span class="terminal-dot terminal-dot-max"></span>
+                  </div>
+                  <div class="terminal-toolbar-actions">
+                    <div class="terminal-toolbar-label" id="terminalToolbarLabel">console@redteam: ready</div>
+                    <button class="terminal-fullscreen-btn" id="toggleTerminalFullscreenBtn" type="button" aria-pressed="false">Full Screen</button>
+                  </div>
+                </div>
+                <pre id="consoleOutput">Memuat konfigurasi backend...</pre>
+              </section>
+              <div class="interactive-console-controls hidden" id="interactiveConsoleControls">
+                <label class="terminal-input-shell" for="interactiveConsoleInput">
+                  <span class="terminal-prompt" id="interactivePromptLabel">msf6 &gt;</span>
+                  <div class="interactive-console-entry">
+                    <input
+                      id="interactiveConsoleInput"
+                      class="interactive-console-input"
+                      spellcheck="false"
+                      placeholder="Ketik command lanjutan, lalu Enter atau klik Kirim..."
+                      autocomplete="off"
+                      autocapitalize="off"
+                    />
+                    <span class="interactive-hint-label" id="interactiveHintLabel">Tab untuk auto-complete command umum. Enter untuk kirim.</span>
+                  </div>
+                </label>
+                <div class="interactive-console-actions">
+                  <button class="primary-button compact" id="sendInteractiveConsoleBtn" type="button" disabled>Kirim</button>
+                  <button class="ghost-button compact" id="closeInteractiveConsoleBtn" type="button" disabled>Tutup Session</button>
+                </div>
               </div>
-              <div class="timeline-list" id="timelineList"></div>
             </div>
 
             <div class="insight-panel hidden" data-insight-panel="evidence">
               <div class="console-card-head">
                 <h3>Evidence Highlights</h3>
-                <span id="evidenceCountLabel">0 items</span>
+                <div class="export-actions">
+                  <button class="ghost-button compact" id="exportVisibleEvidenceBtn" type="button" disabled>Export Evidence JSON</button>
+                  <span id="evidenceCountLabel">0 items</span>
+                </div>
               </div>
               <div class="evidence-list" id="evidenceList"></div>
             </div>
           </div>
         </aside>
+      </section>
+
+      <section class="operations-grid">
+        <div class="history-card operations-shell is-collapsed">
+          <div class="operations-shell-head">
+            <div>
+              <p class="eyebrow">Operator Workspace</p>
+              <h3>Assessment, environment, dan advanced actions</h3>
+            </div>
+            <div class="operations-shell-head-actions">
+              <small id="operationsTabNote">Area kerja utama setelah assessment mulai berjalan.</small>
+              <button class="ghost-button compact" id="toggleOperationsBtn" type="button" aria-expanded="false" aria-controls="operationsShellBody">Buka Workspace</button>
+            </div>
+          </div>
+          <div class="operations-shell-body hidden" id="operationsShellBody">
+          <div class="operations-tab-row" id="operationsTabRow" role="tablist" aria-label="Menu workspace">
+            <button class="operations-tab is-active" type="button" role="tab" aria-selected="true" data-operations-tab="workspace">Workspace</button>
+            <button class="operations-tab" type="button" role="tab" aria-selected="false" data-operations-tab="health">Lab Health</button>
+            <button class="operations-tab" type="button" role="tab" aria-selected="false" data-operations-tab="advanced">Advanced</button>
+          </div>
+
+          <div class="operations-panel" data-operations-panel="workspace">
+            <article class="operations-card operations-card-wide">
+              <div class="console-card-head">
+                <div>
+                  <p class="eyebrow">Assessment Library</p>
+                  <h3>Export dan workspace aktif</h3>
+                </div>
+                <div class="export-actions">
+                  <button class="ghost-button compact" id="viewAssessmentEvidenceBtn" type="button" disabled>Assessment JSON</button>
+                  <button class="ghost-button compact" id="viewAssessmentMarkdownBtn" type="button" disabled>Assessment MD</button>
+                  <button class="ghost-button compact" id="viewAssessmentHtmlBtn" type="button" disabled>Assessment HTML</button>
+                </div>
+              </div>
+              <div class="assessment-library-grid">
+                <div class="workspace-browser">
+                  <div class="workspace-head">
+                    <strong id="workspacePathLabel">Workspace belum dipilih</strong>
+                    <button class="ghost-button compact" id="refreshWorkspaceBtn" type="button" disabled>Refresh Workspace</button>
+                  </div>
+                  <div class="workspace-sections" id="workspaceSections">Belum ada assessment aktif atau workspace belum tersedia.</div>
+                  <div class="workspace-preview">
+                    <div class="workspace-preview-head">
+                      <strong id="workspacePreviewTitle">Preview file</strong>
+                      <span id="workspacePreviewMeta">Belum ada file dipilih</span>
+                    </div>
+                    <pre id="workspacePreviewContent">Workspace assessment aktif akan tampil di sini bersama file report, parsed JSON, dan log.</pre>
+                  </div>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <div class="operations-panel hidden" data-operations-panel="health">
+            <div class="health-tab-row" id="healthTabRow" role="tablist" aria-label="Menu lab health">
+              <button class="health-tab is-active" type="button" role="tab" aria-selected="true" data-health-tab="strategy">Tooling & Strategy</button>
+              <button class="health-tab" type="button" role="tab" aria-selected="false" data-health-tab="reference">Reference Data</button>
+            </div>
+
+            <div class="health-panel" data-health-panel="strategy">
+              <article class="operations-card">
+                <div class="console-card-head">
+                  <div>
+                    <p class="eyebrow">Lab Health</p>
+                    <h3>Tooling dan strategi</h3>
+                  </div>
+                  <button class="ghost-button compact" id="refreshToolsBtn" type="button">Refresh Tools</button>
+                </div>
+                <div class="tool-summary-grid" id="toolSummaryGrid"></div>
+                <div class="preset-list" id="chainPresetList">Memuat chain preset...</div>
+              </article>
+            </div>
+
+            <div class="health-panel hidden" data-health-panel="reference">
+              <article class="operations-card">
+                <div class="console-card-head">
+                  <div>
+                    <p class="eyebrow">Reference Data</p>
+                    <h3>Konteks target aktif</h3>
+                  </div>
+                  <button class="ghost-button compact" id="refreshAssetsBtn" type="button">Refresh Context</button>
+                </div>
+                <div class="asset-focus-card" id="targetAssetCard">Belum ada asset match untuk target aktif.</div>
+              </article>
+            </div>
+          </div>
+
+          <div class="operations-panel hidden" data-operations-panel="advanced">
+            <div class="advanced-tab-row advanced-tab-row-compact" id="advancedTabRow" role="tablist" aria-label="Menu advanced">
+              <button class="advanced-tab is-active" type="button" role="tab" aria-selected="true" data-advanced-tab="findings">Findings</button>
+              <button class="ghost-button compact" id="openImportModalBtn" type="button">Import Output</button>
+            </div>
+
+            <div class="advanced-panel" data-advanced-panel="findings">
+              <article class="history-card operations-card">
+                <div class="console-card-head">
+                  <div>
+                    <p class="eyebrow">Findings Workspace</p>
+                    <h3>Normalized Findings</h3>
+                  </div>
+                  <span id="assessmentFindingsLabel">0 findings</span>
+                </div>
+                <div class="evidence-list" id="assessmentFindings">Belum ada normalized finding.</div>
+              </article>
+            </div>
+          </div>
+          </div>
+        </div>
       </section>
     </main>
   </div>
@@ -175,7 +368,74 @@
     </div>
   </div>
 
+  <div class="modal-backdrop hidden" id="toolInspectModal" aria-hidden="true">
+    <div class="modal-card tool-inspect-modal" role="dialog" aria-modal="true" aria-labelledby="toolInspectTitle">
+      <div class="modal-head tool-inspect-head">
+        <div>
+          <p class="eyebrow">Tool Inspect</p>
+          <h3 id="toolInspectTitle">Pilih tool</h3>
+        </div>
+        <div class="tool-inspect-topline">
+          <span id="toolInspectBadge" class="severity-pill severity-info">info</span>
+          <button class="ghost-button compact" id="closeToolInspectBtn" type="button">Tutup</button>
+        </div>
+      </div>
+      <div class="tool-inspect-meta" id="toolInspectMeta"></div>
+      <p class="tool-inspect-copy" id="toolInspectPurpose">Klik Inspect pada salah satu tool untuk membuka referensi command dan konteks penggunaannya.</p>
+      <div class="tool-inspect-grid">
+        <section class="tool-inspect-section">
+          <strong>Quick Reference</strong>
+          <div class="tool-command-stack" id="toolInspectCommands"></div>
+        </section>
+        <section class="tool-inspect-section">
+          <strong>Kapan Dipakai</strong>
+          <div id="toolInspectUsage">Belum ada tool dipilih.</div>
+        </section>
+        <section class="tool-inspect-section">
+          <strong>Tips Operator</strong>
+          <div class="tool-operator-notes" id="toolInspectNotes">Belum ada tool dipilih.</div>
+        </section>
+        <section class="tool-inspect-section">
+          <strong>Dipakai Oleh Modul</strong>
+          <div class="tool-module-list" id="toolInspectModules">Belum ada tool dipilih.</div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="importParserModal" aria-hidden="true">
+    <div class="modal-card import-parser-modal" role="dialog" aria-modal="true" aria-labelledby="importParserTitle">
+      <div class="modal-head tool-inspect-head">
+        <div>
+          <p class="eyebrow">Import Parser</p>
+          <h3 id="importParserTitle">Paste hasil tool eksternal</h3>
+        </div>
+        <button class="ghost-button compact" id="closeImportModalBtn" type="button">Tutup</button>
+      </div>
+      <div class="import-form">
+        <label class="field import-field">
+          <span>Tool Name</span>
+          <select id="importToolSelect">
+            <option value="nmap">nmap</option>
+            <option value="nikto">nikto</option>
+            <option value="httpx">httpx</option>
+            <option value="generic">generic</option>
+          </select>
+        </label>
+        <label class="field import-field">
+          <span>Paste Output</span>
+          <textarea id="importContentInput" placeholder="Tempel output tool di sini..."></textarea>
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost-button" id="clearImportModalBtn" type="button">Clear</button>
+        <button class="primary-button" id="parseImportBtn" type="button">Parse Output</button>
+      </div>
+      <div class="import-result" id="importResult">Belum ada output yang diparse.</div>
+    </div>
+  </div>
+
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="script.js?v=20260626-evidence-summary-sync"></script>
+  <script src="script.js?v=20260703-auth-fix"></script>
 </body>
 </html>

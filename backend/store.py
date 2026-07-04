@@ -40,6 +40,65 @@ class JobStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assessments (
+                  id TEXT PRIMARY KEY,
+                  target TEXT NOT NULL,
+                  target_kind TEXT NOT NULL,
+                  assessment_type TEXT NOT NULL,
+                  risk_mode TEXT NOT NULL,
+                  operator_name TEXT NOT NULL,
+                  ticket_ref TEXT NOT NULL,
+                  note TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  metadata TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS approvals (
+                  id TEXT PRIMARY KEY,
+                  assessment_id TEXT NOT NULL,
+                  module_id TEXT NOT NULL,
+                  approved_by TEXT NOT NULL,
+                  ticket_ref TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  expires_at TEXT NOT NULL DEFAULT '',
+                  metadata TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS findings (
+                  id TEXT PRIMARY KEY,
+                  assessment_id TEXT NOT NULL,
+                  source_key TEXT NOT NULL,
+                  target TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  severity TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  module_id TEXT NOT NULL,
+                  module_title TEXT NOT NULL,
+                  phase_label TEXT NOT NULL,
+                  description TEXT NOT NULL DEFAULT '[]',
+                  impact TEXT NOT NULL DEFAULT '[]',
+                  recommendations TEXT NOT NULL DEFAULT '[]',
+                  evidence_lines TEXT NOT NULL DEFAULT '[]',
+                  artifacts TEXT NOT NULL DEFAULT '{}',
+                  job_refs TEXT NOT NULL DEFAULT '[]',
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  metadata TEXT NOT NULL DEFAULT '{}',
+                  UNIQUE (assessment_id, source_key)
+                )
+                """
+            )
 
             existing_columns = {
                 row["name"]
@@ -97,7 +156,7 @@ class JobStore:
                 ORDER BY created_at DESC
                 """
             ).fetchall()
-        return [self._deserialize(row) for row in rows]
+        return [self._deserialize_job(row) for row in rows]
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -105,7 +164,7 @@ class JobStore:
                 "SELECT * FROM jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
-        return self._deserialize(row) if row else None
+        return self._deserialize_job(row) if row else None
 
     def update_job(
         self,
@@ -165,7 +224,182 @@ class JobStore:
             connection.commit()
         return int(cursor.rowcount or 0)
 
-    def _deserialize(self, row: sqlite3.Row) -> dict[str, Any]:
+    def create_assessment(self, payload: dict[str, Any]) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO assessments (
+                  id, target, target_kind, assessment_type, risk_mode, operator_name,
+                  ticket_ref, note, status, created_at, updated_at, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["id"],
+                    payload["target"],
+                    payload["target_kind"],
+                    payload["assessment_type"],
+                    payload["risk_mode"],
+                    payload["operator_name"],
+                    payload["ticket_ref"],
+                    payload["note"],
+                    payload["status"],
+                    payload["created_at"],
+                    payload["updated_at"],
+                    json.dumps(payload.get("metadata", {})),
+                ),
+            )
+            connection.commit()
+
+    def list_assessments(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM assessments ORDER BY created_at DESC"
+            ).fetchall()
+        return [self._deserialize_assessment(row) for row in rows]
+
+    def get_assessment(self, assessment_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM assessments WHERE id = ?",
+                (assessment_id,),
+            ).fetchone()
+        return self._deserialize_assessment(row) if row else None
+
+    def update_assessment(self, assessment_id: str, *, status: str | None = None, metadata: dict[str, Any] | None = None, updated_at: str) -> None:
+        current = self.get_assessment(assessment_id)
+        if not current:
+            return
+        next_status = status or current["status"]
+        next_metadata = metadata if metadata is not None else current.get("metadata", {})
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE assessments
+                SET status = ?, updated_at = ?, metadata = ?
+                WHERE id = ?
+                """,
+                (next_status, updated_at, json.dumps(next_metadata), assessment_id),
+            )
+            connection.commit()
+
+    def create_approval(self, payload: dict[str, Any]) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO approvals (
+                  id, assessment_id, module_id, approved_by, ticket_ref, reason, created_at, expires_at, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["id"],
+                    payload["assessment_id"],
+                    payload["module_id"],
+                    payload["approved_by"],
+                    payload["ticket_ref"],
+                    payload["reason"],
+                    payload["created_at"],
+                    payload.get("expires_at", ""),
+                    json.dumps(payload.get("metadata", {})),
+                ),
+            )
+            connection.commit()
+
+    def list_approvals(self, assessment_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            if assessment_id:
+                rows = connection.execute(
+                    "SELECT * FROM approvals WHERE assessment_id = ? ORDER BY created_at DESC",
+                    (assessment_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM approvals ORDER BY created_at DESC"
+                ).fetchall()
+        return [self._deserialize_approval(row) for row in rows]
+
+    def get_approval(self, assessment_id: str, module_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM approvals
+                WHERE assessment_id = ? AND module_id = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (assessment_id, module_id),
+            ).fetchone()
+        return self._deserialize_approval(row) if row else None
+
+    def replace_assessment_findings(self, assessment_id: str, findings: list[dict[str, Any]]) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM findings WHERE assessment_id = ?", (assessment_id,))
+            for finding in findings:
+                connection.execute(
+                    """
+                    INSERT INTO findings (
+                      id, assessment_id, source_key, target, title, severity, status,
+                      module_id, module_title, phase_label, description, impact, recommendations,
+                      evidence_lines, artifacts, job_refs, created_at, updated_at, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        finding["id"],
+                        assessment_id,
+                        finding["source_key"],
+                        finding.get("target", ""),
+                        finding["title"],
+                        finding.get("severity", "INFO"),
+                        finding.get("status", "open"),
+                        finding.get("module_id", ""),
+                        finding.get("module_title", ""),
+                        finding.get("phase_label", ""),
+                        json.dumps(finding.get("description", [])),
+                        json.dumps(finding.get("impact", [])),
+                        json.dumps(finding.get("recommendations", [])),
+                        json.dumps(finding.get("evidence_lines", [])),
+                        json.dumps(finding.get("artifacts", {})),
+                        json.dumps(finding.get("job_refs", [])),
+                        finding.get("created_at", ""),
+                        finding.get("updated_at", ""),
+                        json.dumps(finding.get("metadata", {})),
+                    ),
+                )
+            connection.commit()
+
+    def list_findings(self, assessment_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM findings WHERE assessment_id = ? ORDER BY updated_at DESC, severity DESC, title ASC",
+                (assessment_id,),
+            ).fetchall()
+        return [self._deserialize_finding(row) for row in rows]
+
+    def update_finding(self, assessment_id: str, finding_id: str, *, status: str | None = None, metadata: dict[str, Any] | None = None, updated_at: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM findings WHERE assessment_id = ? AND id = ?",
+                (assessment_id, finding_id),
+            ).fetchone()
+            if not row:
+                return None
+            current = self._deserialize_finding(row)
+            next_status = status or current.get("status", "open")
+            next_metadata = metadata if metadata is not None else current.get("metadata", {})
+            connection.execute(
+                "UPDATE findings SET status = ?, metadata = ?, updated_at = ? WHERE assessment_id = ? AND id = ?",
+                (next_status, json.dumps(next_metadata), updated_at, assessment_id, finding_id),
+            )
+            connection.commit()
+        return self.get_finding(assessment_id, finding_id)
+
+    def get_finding(self, assessment_id: str, finding_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM findings WHERE assessment_id = ? AND id = ?",
+                (assessment_id, finding_id),
+            ).fetchone()
+        return self._deserialize_finding(row) if row else None
+
+    def _deserialize_job(self, row: sqlite3.Row) -> dict[str, Any]:
         logs = self._normalize_logs(json.loads(row["logs"]))
         severity_summary = self._ensure_dict(json.loads(row["severity_summary"]))
         evidence = self._ensure_list(json.loads(row["evidence"]))
@@ -188,6 +422,58 @@ class JobStore:
             "evidence": evidence,
             "module_runs": module_runs,
             "runtime_meta": runtime_meta,
+        }
+
+    def _deserialize_assessment(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "target": row["target"],
+            "target_kind": row["target_kind"],
+            "assessment_type": row["assessment_type"],
+            "risk_mode": row["risk_mode"],
+            "operator_name": row["operator_name"],
+            "ticket_ref": row["ticket_ref"],
+            "note": row["note"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "metadata": self._ensure_dict_generic(json.loads(row["metadata"])),
+        }
+
+    def _deserialize_approval(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "assessment_id": row["assessment_id"],
+            "module_id": row["module_id"],
+            "approved_by": row["approved_by"],
+            "ticket_ref": row["ticket_ref"],
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+            "metadata": self._ensure_dict_generic(json.loads(row["metadata"])),
+        }
+
+    def _deserialize_finding(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "assessment_id": row["assessment_id"],
+            "source_key": row["source_key"],
+            "target": row["target"],
+            "title": row["title"],
+            "severity": row["severity"],
+            "status": row["status"],
+            "module_id": row["module_id"],
+            "module_title": row["module_title"],
+            "phase_label": row["phase_label"],
+            "description": self._ensure_list(json.loads(row["description"])),
+            "impact": self._ensure_list(json.loads(row["impact"])),
+            "recommendations": self._ensure_list(json.loads(row["recommendations"])),
+            "evidence_lines": self._ensure_list(json.loads(row["evidence_lines"])),
+            "artifacts": self._ensure_dict_generic(json.loads(row["artifacts"])),
+            "job_refs": self._ensure_list(json.loads(row["job_refs"])),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "metadata": self._ensure_dict_generic(json.loads(row["metadata"])),
         }
 
     def _normalize_logs(self, logs: Any) -> list[dict[str, Any]]:

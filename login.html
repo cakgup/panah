@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login | PANAH</title>
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
+  <link rel="stylesheet" href="/static/login.css">
+</head>
+<body class="login-page">
+  <div class="login-shell">
+    <div class="login-wrapper">
+      <section class="login-left">
+        <div class="login-left-inner">
+          <div class="login-brand-mark">PA</div>
+          <div class="login-brand-logo">
+            <img src="/static/logo.png" alt="PANAH logo">
+          </div>
+          <div class="login-brand-copy">
+            <span class="login-eyebrow">Lab Workspace</span>
+            <h1 class="login-headline">PANAH</h1>
+            <p class="login-description">
+              Pentest Automation and Network Assessment Hub
+            </p>
+          </div>
+        </div>
+      </section>
+      <section class="login-right">
+        <div class="login-card">
+          <div class="login-card-head">
+            <span class="login-eyebrow login-eyebrow-muted">Welcome back</span>
+            <h2 class="login-form-title">Sign In</h2>
+            <p class="login-form-subtitle">
+              Untuk sementara akses manajemen dibuat sesederhana mungkin. Cukup klik tombol masuk untuk melanjutkan ke PANAH.
+            </p>
+          </div>
+
+          __ERROR_BLOCK__
+
+          <form method="get" action="/login/access" class="login-form" novalidate>
+            <input type="hidden" name="next_url" value="__NEXT_URL__">
+            <input type="hidden" name="username" value="top-management">
+
+            <div class="login-hint login-hint-banner">
+              Akses sementara tanpa username dan password untuk kebutuhan presentasi, demo internal, dan akses cepat top management.
+            </div>
+
+            <div class="login-actions">
+              <button type="submit" class="login-submit">Masuk ke Console</button>
+            </div>
+          </form>
+
+          <div class="login-contact">
+            <span>Need access or assistance?</span><br>
+            Hubungi administrator lab internal atau tim pengembang platform.
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</body>
+</html>

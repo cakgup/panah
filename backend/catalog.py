@@ -17,6 +17,12 @@ class ModuleSpec:
     engine: str
     mode: str
     preview: tuple[str, ...]
+    risk_class: str
+    requires_approval: bool
+    safe_in_chain: bool
+    deep_in_chain: bool
+    manual_confirmation: bool
+    target_kinds: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,20 @@ def module(
     mitre: str,
     preview: tuple[str, ...],
 ) -> ModuleSpec:
+    risk_class = "safe"
+    requires_approval = False
+    safe_in_chain = True
+    deep_in_chain = True
+    manual_confirmation = False
+
+    if risk in {"lab", "restricted"}:
+        risk_class = "deep"
+    if phase_id in {"exploit", "install", "c2", "objective"} or risk == "restricted":
+        risk_class = "intrusive"
+        requires_approval = True
+        safe_in_chain = False
+        manual_confirmation = True
+
     return ModuleSpec(
         id=id,
         title=title,
@@ -53,8 +73,14 @@ def module(
         risk=risk,
         mitre=mitre,
         engine="python-runner",
-        mode="simulation-only",
+        mode="live-adapter",
         preview=preview,
+        risk_class=risk_class,
+        requires_approval=requires_approval,
+        safe_in_chain=safe_in_chain,
+        deep_in_chain=deep_in_chain,
+        manual_confirmation=manual_confirmation,
+        target_kinds=("ip",),
     )
 
 
@@ -573,7 +599,7 @@ PHASE_PLAYBOOKS: dict[str, ModulePlaybook] = {
     "recon": playbook(
         skill_level="foundational",
         operator_focus="surface mapping",
-        tooling=("nmap", "dnsx", "httpx"),
+        tooling=("nmap", "masscan", "rustscan", "dnsx", "httpx"),
         evidence=("open service notes", "reachable host list", "vhost observations"),
         telemetry=("firewall accepts", "dns resolver queries", "http metadata"),
         depth_profile="surface",
@@ -583,7 +609,7 @@ PHASE_PLAYBOOKS: dict[str, ModulePlaybook] = {
     "baseline": playbook(
         skill_level="foundational",
         operator_focus="validation baseline",
-        tooling=("httpx", "whatweb", "curl"),
+        tooling=("httpx", "whatweb", "wappalyzer", "curl"),
         evidence=("header snapshot", "path exposure list", "tls note"),
         telemetry=("web access logs", "reverse proxy headers", "tls handshake details"),
         depth_profile="baseline",
@@ -603,7 +629,7 @@ PHASE_PLAYBOOKS: dict[str, ModulePlaybook] = {
     "delivery": playbook(
         skill_level="intermediate",
         operator_focus="delivery simulation",
-        tooling=("swaks", "curl", "mitmproxy"),
+        tooling=("swaks", "curl", "mitmproxy", "ngrok"),
         evidence=("header review", "hosting note", "redirect checklist"),
         telemetry=("mail gateway logs", "proxy requests", "dns or llmnr alerts"),
         depth_profile="tabletop",
@@ -613,7 +639,7 @@ PHASE_PLAYBOOKS: dict[str, ModulePlaybook] = {
     "exploit": playbook(
         skill_level="intermediate",
         operator_focus="control validation",
-        tooling=("burpsuite", "sqlmap-safe", "ffuf-safe"),
+        tooling=("burpsuite", "sqlmap", "ffuf", "jwt-tool"),
         evidence=("validation gap note", "auth control drift", "session trace"),
         telemetry=("waf alerts", "auth failures", "application error logs"),
         depth_profile="control-review",
@@ -623,7 +649,7 @@ PHASE_PLAYBOOKS: dict[str, ModulePlaybook] = {
     "install": playbook(
         skill_level="advanced",
         operator_focus="persistence review",
-        tooling=("autoruns", "crontab", "systemctl"),
+        tooling=("autoruns", "crontab", "systemctl", "schtasks", "reg", "sc"),
         evidence=("scheduled task note", "run-key audit", "recovery checklist"),
         telemetry=("task scheduler events", "cron changes", "service startup drift"),
         depth_profile="defender-audit",
@@ -633,7 +659,7 @@ PHASE_PLAYBOOKS: dict[str, ModulePlaybook] = {
     "c2": playbook(
         skill_level="advanced",
         operator_focus="beacon detection",
-        tooling=("zeek", "tcpdump", "suricata"),
+        tooling=("zeek", "tcpdump", "suricata", "wireshark", "sigma", "sysmon"),
         evidence=("beacon rhythm note", "tunnel governance", "egress review"),
         telemetry=("proxy logs", "edr network graph", "dns beacon cadence"),
         depth_profile="detection-review",
@@ -643,7 +669,7 @@ PHASE_PLAYBOOKS: dict[str, ModulePlaybook] = {
     "objective": playbook(
         skill_level="advanced",
         operator_focus="impact reporting",
-        tooling=("jq", "pandoc", "graphviz"),
+        tooling=("jq", "pandoc", "graphviz", "markdown", "killchain"),
         evidence=("blast radius summary", "pivot path graph", "final report bundle"),
         telemetry=("identity alerts", "lateral movement detections", "closure checkpoints"),
         depth_profile="reporting",
@@ -655,14 +681,14 @@ PHASE_PLAYBOOKS: dict[str, ModulePlaybook] = {
 
 MODULE_PLAYBOOK_OVERRIDES: dict[str, dict[str, Any]] = {
     "recon-dns-enumeration": {
-        "tooling": ("dig", "dnsx", "httpx"),
+        "tooling": ("dig", "dnsx", "dnsrecon", "fierce", "subfinder", "httpx"),
         "evidence": ("resolver findings", "vhost shortlist", "name record map"),
         "depth_profile": "service-metadata",
         "allowed_checks": ("dns records", "resolver metadata", "vhost correlation"),
         "simulation_stance": "assertive-lab",
     },
     "recon-amass-expansion": {
-        "tooling": ("amass", "dig", "httpx"),
+        "tooling": ("amass", "subfinder", "shuffledns", "chaos", "waybackurls", "gau", "dig", "dnsx", "httpx"),
         "operator_focus": "asset expansion",
         "evidence": ("subdomain shortlist", "asset cluster map", "scope expansion note"),
         "telemetry": ("dns queries", "resolver metadata", "web host overlap"),
@@ -671,7 +697,7 @@ MODULE_PLAYBOOK_OVERRIDES: dict[str, dict[str, Any]] = {
         "simulation_stance": "assertive-lab",
     },
     "baseline-content-discovery": {
-        "tooling": ("ffuf-safe", "nuclei", "httpx"),
+        "tooling": ("ffuf", "gobuster", "katana", "nuclei", "httpx"),
         "evidence": ("approved path review", "status code matrix", "exposed route note"),
         "depth_profile": "approved-path-review",
         "allowed_checks": ("approved path responses", "redirect behavior", "status matrix"),
@@ -687,7 +713,7 @@ MODULE_PLAYBOOK_OVERRIDES: dict[str, dict[str, Any]] = {
         "simulation_stance": "assertive-lab",
     },
     "baseline-nikto-review": {
-        "tooling": ("nikto", "nuclei", "whatweb"),
+        "tooling": ("nikto", "nuclei", "whatweb", "wpscan", "searchsploit"),
         "operator_focus": "misconfiguration review",
         "evidence": ("default file note", "header misconfig note", "web hardening checklist"),
         "telemetry": ("web access logs", "banner clues", "error response patterns"),
@@ -696,7 +722,7 @@ MODULE_PLAYBOOK_OVERRIDES: dict[str, dict[str, Any]] = {
         "simulation_stance": "assertive-lab",
     },
     "baseline-gobuster-routes": {
-        "tooling": ("ffuf-safe", "httpx", "curl"),
+        "tooling": ("gobuster", "ffuf", "katana", "httpx", "curl"),
         "operator_focus": "route expansion",
         "evidence": ("route shortlist", "backup path note", "admin exposure review"),
         "telemetry": ("web path hits", "redirect drift", "alternate port overlap"),
@@ -712,7 +738,7 @@ MODULE_PLAYBOOK_OVERRIDES: dict[str, dict[str, Any]] = {
         "simulation_stance": "assertive-lab",
     },
     "sensitive-file-discovery": {
-        "tooling": ("curl", "httpx", "file"),
+        "tooling": ("curl", "httpx", "file", "strings", "jq"),
         "operator_focus": "downloadable file hunting",
         "evidence": ("sensitive file paths", "credential exposure shortlist", "high-value artifact note"),
         "telemetry": ("web access logs", "reverse proxy traces", "download request alerts"),
@@ -720,70 +746,93 @@ MODULE_PLAYBOOK_OVERRIDES: dict[str, dict[str, Any]] = {
         "allowed_checks": ("downloadable config discovery", "exposed repository files", "backup artifact review"),
         "simulation_stance": "intrusive-lab",
     },
+    "baseline-web-fingerprint": {
+        "tooling": ("httpx", "whatweb", "wappalyzer", "curl"),
+    },
     "recon-service-scan": {
+        "tooling": ("nmap", "masscan", "rustscan", "ncat", "socat", "httpx"),
         "depth_profile": "nse-enriched-metadata",
         "allowed_checks": ("port reachability", "service fingerprint", "approved metadata scripts", "banner/title/cert harvest"),
         "simulation_stance": "intrusive-lab",
     },
     "recon-host-discovery": {
+        "tooling": ("nmap", "masscan", "rustscan", "ncat"),
         "depth_profile": "host-inventory",
         "allowed_checks": ("host up check", "latency snapshot", "inventory confirmation"),
         "simulation_stance": "assertive-lab",
     },
     "weapon-defender-view": {
         "operator_focus": "defender visibility",
-        "tooling": ("yara", "strings", "sha256sum"),
+        "tooling": ("yara", "strings", "sha256sum", "sigma", "sysmon"),
+    },
+    "weapon-artifact-review": {
+        "tooling": ("sha256sum", "file", "yara", "strings"),
+    },
+    "weapon-dropper-safety": {
+        "tooling": ("sha256sum", "file", "yara", "strings"),
     },
     "delivery-email-tabletop": {
-        "tooling": ("swaks", "mailparser", "urlscan"),
+        "tooling": ("swaks", "mailparser", "urlscan", "ngrok"),
         "telemetry": ("smtp relay logs", "gateway detections", "user click simulations"),
     },
     "delivery-web-hosting-review": {
-        "tooling": ("curl", "httpx", "mitmproxy"),
+        "tooling": ("curl", "httpx", "mitmproxy", "ngrok", "urlscan"),
     },
     "delivery-responder-awareness": {
         "skill_level": "foundational",
         "operator_focus": "network awareness",
-        "tooling": ("responder-lab", "tcpdump", "wireshark"),
+        "tooling": ("responder", "mitm6", "bettercap", "tcpdump", "wireshark"),
     },
     "exploit-sql-validation": {
-        "tooling": ("burpsuite", "sqlmap-safe", "jq"),
+        "tooling": ("burpsuite", "sqlmap", "commix", "jq", "curl"),
         "telemetry": ("waf validation alerts", "500 response spikes", "db error traces"),
         "simulation_stance": "intrusive-lab",
     },
     "exploit-auth-control-review": {
-        "tooling": ("hydra-lab", "burpsuite", "otp review"),
+        "tooling": ("hydra", "medusa", "crowbar", "kerbrute", "ncrack", "patator", "burpsuite", "otp-review"),
         "evidence": ("lockout threshold note", "mfa gap note", "auth log sample"),
         "simulation_stance": "intrusive-lab",
     },
     "exploit-session-review": {
-        "tooling": ("burpsuite", "jwt-tool", "mitmproxy"),
+        "tooling": ("burpsuite", "jwt-tool", "mitmproxy", "dalfox", "xsstrike", "beef", "bettercap", "metasploit"),
         "simulation_stance": "intrusive-lab",
     },
+    "install-persistence-checklist": {
+        "tooling": ("autoruns", "crontab", "systemctl", "schtasks", "reg", "sc"),
+    },
     "install-registry-cron-audit": {
-        "tooling": ("autoruns", "schtasks", "crontab"),
+        "tooling": ("autoruns", "schtasks", "crontab", "systemctl", "reg", "sc"),
+    },
+    "install-defender-recovery": {
+        "tooling": ("autoruns", "systemctl", "sc", "reg", "schtasks", "sysmon"),
+    },
+    "c2-telemetry-review": {
+        "tooling": ("zeek", "tcpdump", "suricata", "wireshark", "sigma", "sysmon"),
     },
     "c2-tunnel-governance": {
-        "tooling": ("chisel-lab", "ssh -D", "proxychains"),
+        "tooling": ("chisel", "ssh", "proxychains", "socat", "ncat", "ngrok", "mitmproxy"),
         "evidence": ("tunnel approval note", "egress boundary note", "teardown checklist"),
         "simulation_stance": "intrusive-lab",
     },
     "c2-framework-awareness": {
         "skill_level": "intermediate",
         "operator_focus": "framework awareness",
-        "tooling": ("sigma", "suricata", "sysmon review"),
+        "tooling": ("metasploit", "bettercap", "suricata", "sigma", "sysmon", "killchain"),
+    },
+    "objective-credential-impact": {
+        "tooling": ("hashcat", "john", "jq", "pandoc", "graphviz", "markdown"),
     },
     "objective-lateral-movement-impact": {
-        "tooling": ("bloodhound-lab", "graphviz", "jq"),
+        "tooling": ("bloodhound", "bloodhound-python", "enum4linux-ng", "impacket", "mimikatz", "rpcclient", "smbclient", "ldapsearch", "graphviz", "jq"),
         "evidence": ("pivot path graph", "segment weakness note", "trust boundary map"),
     },
     "objective-evidence-bundle": {
         "skill_level": "foundational",
         "operator_focus": "report assembly",
-        "tooling": ("jq", "pandoc", "markdown"),
+        "tooling": ("jq", "pandoc", "markdown", "graphviz", "killchain"),
     },
     "objective-hashcat-impact": {
-        "tooling": ("hashcat", "jq", "pandoc"),
+        "tooling": ("hashcat", "jq", "pandoc", "markdown"),
         "operator_focus": "hash exposure impact",
         "evidence": ("crackability tier note", "credential blast radius", "reset priority matrix"),
         "telemetry": ("identity alerts", "privilege concentration", "password reset checkpoints"),
@@ -792,7 +841,7 @@ MODULE_PLAYBOOK_OVERRIDES: dict[str, dict[str, Any]] = {
         "simulation_stance": "intrusive-lab",
     },
     "objective-john-audit": {
-        "tooling": ("john", "jq", "markdown"),
+        "tooling": ("john", "jq", "markdown", "pandoc"),
         "operator_focus": "password quality audit",
         "evidence": ("weak pattern note", "policy gap review", "mfa uplift recommendation"),
         "telemetry": ("identity alerts", "policy exceptions", "password hygiene trends"),
@@ -801,7 +850,7 @@ MODULE_PLAYBOOK_OVERRIDES: dict[str, dict[str, Any]] = {
         "simulation_stance": "intrusive-lab",
     },
     "read-sensitive-file": {
-        "tooling": ("curl", "base64", "grep"),
+        "tooling": ("curl", "file", "strings", "jq", "sha256sum"),
         "operator_focus": "targeted download evidence",
         "evidence": ("redacted sensitive excerpts", "config exposure note", "credential indicator review"),
         "telemetry": ("web access logs", "download audit", "reverse proxy traces"),

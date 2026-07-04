@@ -8,6 +8,7 @@ from typing import Any
 DEFAULT_ALLOWED_SUBNETS = (
     "10.10.10.0/24",
     "192.168.56.0/24",
+    "10.216.208.0/24",
     "192.168.122.0/24",
     "172.16.56.0/24",
 )
@@ -35,8 +36,8 @@ DEFAULT_LAB_PROFILES = (
     {
         "id": "custom-lab",
         "name": "Custom Internal Lab",
-        "subnets": ["172.16.56.0/24"],
-        "note": "Contoh range lain untuk segment simulasi internal.",
+        "subnets": ["10.216.208.0/24"],
+        "note": "Range lab internal aktif untuk validasi pada subnet 10.216.208.0/24.",
     },
 )
 

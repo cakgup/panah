@@ -15,7 +15,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update \
     && apt-get install -y --no-install-recommends \
+        binutils \
         ca-certificates \
+        cron \
         curl \
         dnsutils \
         file \
@@ -24,8 +26,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         jq \
         netcat-openbsd \
         openssl \
+        openssh-client \
         python3 \
         python3-pip \
+        socat \
         tcpdump \
         unzip \
         wget
@@ -35,22 +39,32 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update \
     && apt-get install -y --no-install-recommends \
         nmap \
+        masscan \
         ffuf \
         gobuster \
         amass \
+        dnsrecon \
+        fierce \
         nikto \
         sqlmap \
-        whatweb
+        whatweb \
+        wpscan
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update \
     && apt-get install -y --no-install-recommends \
         hydra \
+        medusa \
         john \
         hashcat \
+        ncrack \
+        patator \
+        proxychains4 \
+        responder \
         smbclient \
         ldap-utils \
+        swaks \
         yara
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -58,9 +72,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update \
     && apt-get install -y --no-install-recommends \
         graphviz \
+        exploitdb \
+        metasploit-framework \
+        mitmproxy \
         pandoc
 
 RUN python3 -m pip install --break-system-packages \
+        bloodhound \
         impacket \
         sslyze
 
@@ -87,6 +105,6 @@ RUN mkdir -p /app/backend/data
 EXPOSE 4080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:4080/api/jobs > /dev/null || exit 1
+  CMD curl -fsS http://127.0.0.1:4080/api/health > /dev/null || exit 1
 
 CMD ["python3", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "4080"]

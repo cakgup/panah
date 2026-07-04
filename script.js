@@ -2,21 +2,251 @@ const state = {
   config: null,
   modules: [],
   jobs: [],
+  assessments: [],
+  activeAssessmentId: null,
+  activeAssessment: null,
+  activeApprovals: [],
+  activeRecommendations: null,
+  activeFindings: [],
+  activeFindingSummary: null,
+  activeAssessmentDetail: null,
+  activeCorrelation: null,
+  activeWorkspace: null,
+  activeDiff: null,
+  activeDrift: null,
+  approvalsDashboard: null,
+  chainPresets: [],
+  toolsStatus: null,
+  toolingCatalog: [],
+  toolSearchQuery: "",
+  toolStatusFilter: "all",
+  toolSortMode: "usage",
+  selectedToolLabel: "",
+  highlightedModuleId: "",
+  engagements: [],
+  referenceFindings: [],
+  assets: [],
+  targetAsset: null,
+  importResult: null,
+  destructiveActions: [],
+  destructiveResult: null,
+  workspacePreviewPath: "",
   activeJobId: null,
   activeJob: null,
   pollTimer: null,
   tooling: null,
   selectedPhase: "all",
+  catalogSurface: "modules",
   viewMode: "playbook",
+  operationsTab: "workspace",
+  healthTab: "strategy",
+  advancedTab: "findings",
   moduleExecutionProfile: "fast",
   moduleSearchQuery: "",
   insightTab: "console",
-  consoleHeightLocked: false
+  consoleHeightLocked: false,
+  operationsVisible: false,
+  moduleRenderFrame: 0,
+  expandedModuleCommandIds: [],
+  moduleDryRunCache: {},
+  targetAssetTimer: 0,
+  targetAssetRequestSeq: 0,
+  lastTargetAssetKey: "",
+  moduleSearchTimer: 0,
+  toolSearchTimer: 0,
+  operatorWorkspaceLoaded: false,
+  toolCatalogLoaded: false,
+  toolCatalogLoading: false,
+  toolCatalogLoadPromise: null,
+  apiBaseUrl: "",
+  apiBasePromise: null,
+  chainRunPending: false,
+  chainRunStage: "idle",
+  chainRunUiTimer: 0,
+  referencePanelLoaded: false,
+  activeInteractiveSession: null,
+  interactivePollTimer: 0,
+  interactiveTabState: null
 };
 
 const $ = (selector) => document.querySelector(selector);
-const LAST_TARGET_STORAGE_KEY = "lab-console-last-target-ip";
+const LAST_TARGET_STORAGE_KEY = "lab-console-last-target";
 const CONSOLE_MIN_HEIGHT = 260;
+const MODULES_CACHE_KEY = "lab-console-modules-cache-v1";
+const MODULES_CACHE_TTL_MS = 60 * 1000;
+const BACKEND_DEFAULT_PORT = "4080";
+const INTERACTIVE_COMMAND_HINTS = {
+  metasploit: [
+    "help",
+    "search",
+    "use",
+    "show",
+    "show options",
+    "show payloads",
+    "show exploits",
+    "show auxiliary",
+    "info",
+    "check",
+    "run",
+    "exploit",
+    "set",
+    "setg",
+    "unset",
+    "unsetg",
+    "back",
+    "sessions",
+    "jobs",
+    "route",
+    "workspace",
+    "notes",
+    "creds",
+    "services",
+    "hosts",
+    "version",
+    "banner",
+    "exit",
+    "quit"
+  ],
+  ssh: ["help", "exit", "quit", "pwd", "ls", "cd", "cat", "whoami", "id", "uname -a"],
+  smbclient: ["help", "ls", "dir", "cd", "pwd", "get", "put", "mget", "mkdir", "rmdir", "exit", "quit"],
+  rpcclient: ["help", "enumdomusers", "enumdomgroups", "queryuser", "querygroup", "lsaquery", "srvinfo", "exit", "quit"],
+  mysql: ["help", "show databases;", "use ", "show tables;", "select ", "status;", "exit"],
+  psql: ["\\?", "\\l", "\\c ", "\\dt", "\\d ", "select ", "\\q"],
+  ftp: ["help", "ls", "pwd", "cd ", "get ", "put ", "passive", "binary", "ascii", "bye", "quit"],
+  telnet: ["help", "open ", "close", "quit", "status", "send "]
+};
+
+function isAbsoluteUrl(value) {
+  return /^https?:\/\//i.test(String(value || ""));
+}
+
+function normalizeRequestPath(path) {
+  const value = String(path || "").trim();
+  if (!value) return "/";
+  if (isAbsoluteUrl(value)) return value;
+  return value.startsWith("/") ? value : `/${value}`;
+}
+
+function candidateApiBases() {
+  const candidates = [];
+  const append = (value) => {
+    const normalized = String(value || "").trim().replace(/\/+$/, "");
+    if (!normalized || candidates.includes(normalized)) return;
+    candidates.push(normalized);
+  };
+  append(window.localStorage.getItem("lab-console-api-base"));
+  append(window.__LAB_CONSOLE_API_BASE__);
+  append(window.location.origin);
+  if (window.location.port !== BACKEND_DEFAULT_PORT) {
+    append(`${window.location.protocol}//${window.location.hostname}:${BACKEND_DEFAULT_PORT}`);
+  }
+  if (window.location.hostname === "localhost") {
+    append(`${window.location.protocol}//127.0.0.1:${BACKEND_DEFAULT_PORT}`);
+  }
+  return candidates;
+}
+
+function buildRequestUrl(path, base = "") {
+  const normalizedPath = normalizeRequestPath(path);
+  if (isAbsoluteUrl(normalizedPath)) return normalizedPath;
+  if (!base) return normalizedPath;
+  return `${String(base).replace(/\/+$/, "")}${normalizedPath}`;
+}
+
+function apiUrl(path) {
+  const normalizedPath = normalizeRequestPath(path);
+  if (!normalizedPath.startsWith("/api/")) {
+    return buildRequestUrl(normalizedPath);
+  }
+  const base = state.apiBaseUrl
+    || candidateApiBases().find((entry) => entry.endsWith(`:${BACKEND_DEFAULT_PORT}`))
+    || window.location.origin;
+  return buildRequestUrl(normalizedPath, base);
+}
+
+async function probeApiBase(base) {
+  try {
+    const response = await fetch(buildRequestUrl("/api/health", base), {
+      method: "GET",
+      cache: "no-store"
+    });
+    return response.ok;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function resolveApiBase(force = false) {
+  if (!force && state.apiBaseUrl) return state.apiBaseUrl;
+  if (!force && state.apiBasePromise) return state.apiBasePromise;
+  state.apiBasePromise = (async () => {
+    for (const base of candidateApiBases()) {
+      if (await probeApiBase(base)) {
+        state.apiBaseUrl = base;
+        window.localStorage.setItem("lab-console-api-base", base);
+        return base;
+      }
+    }
+    throw new Error("Backend API tidak terdeteksi. Pastikan server backend berjalan di port 4080.");
+  })();
+  try {
+    return await state.apiBasePromise;
+  } finally {
+    state.apiBasePromise = null;
+  }
+}
+
+function debounce(fn, delay = 160) {
+  let timer = 0;
+  return (...args) => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => fn(...args), delay);
+  };
+}
+
+function scheduleModulesRender() {
+  if (state.moduleRenderFrame) return;
+  state.moduleRenderFrame = window.requestAnimationFrame(() => {
+    state.moduleRenderFrame = 0;
+    renderModules();
+  });
+}
+
+function scheduleDeferredTask(task) {
+  const runner = () => Promise.resolve().then(task).catch((error) => console.warn(error));
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(() => runner(), { timeout: 1200 });
+    return;
+  }
+  window.setTimeout(runner, 120);
+}
+
+function readModulesCache() {
+  try {
+    const raw = localStorage.getItem(MODULES_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const savedAt = Number(parsed?.savedAt || 0);
+    const modules = Array.isArray(parsed?.modules) ? parsed.modules : null;
+    if (!modules?.length || !savedAt) return null;
+    if (Date.now() - savedAt > MODULES_CACHE_TTL_MS) return null;
+    return modules;
+  } catch (error) {
+    localStorage.removeItem(MODULES_CACHE_KEY);
+    return null;
+  }
+}
+
+function writeModulesCache(modules) {
+  try {
+    localStorage.setItem(MODULES_CACHE_KEY, JSON.stringify({
+      savedAt: Date.now(),
+      modules: Array.isArray(modules) ? modules : []
+    }));
+  } catch (error) {
+    // Abaikan jika storage penuh atau tidak tersedia.
+  }
+}
 
 function clampConsoleHeight(value) {
   const numericValue = Number(value);
@@ -25,13 +255,12 @@ function clampConsoleHeight(value) {
 }
 
 function insightScrollPanels() {
-  return ["#consoleOutput", "#timelineList", "#evidenceList"]
+  return ["#consoleOutput", "#evidenceList"]
     .map((selector) => $(selector))
     .filter(Boolean);
 }
 
 function activeInsightScrollPanel() {
-  if (state.insightTab === "timeline") return $("#timelineList");
   if (state.insightTab === "evidence") return $("#evidenceList");
   return $("#consoleOutput");
 }
@@ -106,8 +335,81 @@ function showToast(message) {
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 2200);
 }
 
+function setRunChainUiState(stage = "idle", message = "") {
+  state.chainRunStage = stage || "idle";
+  state.chainRunPending = !["idle", "success", "error"].includes(state.chainRunStage);
+  const button = $("#runChainBtn");
+  const note = $("#runChainStatusNote");
+  const stepTarget = $("#workflowStepTarget");
+  const stepAssessment = $("#workflowStepAssessment");
+  const stepReview = $("#workflowStepReview");
+  const applyStepState = (element, mode) => {
+    if (!element) return;
+    element.classList.toggle("is-active", mode === "active");
+    element.classList.toggle("is-done", mode === "done");
+  };
+
+  let buttonLabel = "Run Full Simulation Chain";
+  let noteLabel = message || "Siap menjalankan full chain untuk target aktif.";
+  let stepTargetMode = "";
+  let stepAssessmentMode = "";
+  let stepReviewMode = "";
+
+  if (stage === "preflight") {
+    buttonLabel = "Running...";
+    noteLabel = message || "Memvalidasi target dan menyiapkan payload eksekusi.";
+    stepTargetMode = "active";
+  } else if (stage === "assessment") {
+    buttonLabel = "Running...";
+    noteLabel = message || "Membuat atau menyelaraskan assessment aktif.";
+    stepTargetMode = "done";
+    stepAssessmentMode = "active";
+  } else if (stage === "approval") {
+    buttonLabel = "Running...";
+    noteLabel = message || "Menyimpan approval chain yang dibutuhkan sebelum eksekusi.";
+    stepTargetMode = "done";
+    stepAssessmentMode = "active";
+  } else if (stage === "submitting") {
+    buttonLabel = "Running...";
+    noteLabel = message || "Mengirim full simulation chain ke backend worker.";
+    stepTargetMode = "done";
+    stepAssessmentMode = "done";
+    stepReviewMode = "active";
+  } else if (stage === "success") {
+    buttonLabel = "Run Full Simulation Chain";
+    noteLabel = message || "Job full chain berhasil dibuat. Pantau live console dan evidence.";
+    stepTargetMode = "done";
+    stepAssessmentMode = "done";
+    stepReviewMode = "active";
+  } else if (stage === "error") {
+    buttonLabel = "Run Full Simulation Chain";
+    noteLabel = message || "Eksekusi chain berhenti. Periksa toast atau recent jobs untuk detail.";
+    stepTargetMode = "";
+    stepAssessmentMode = "";
+    stepReviewMode = "";
+  }
+
+  if (button) {
+    button.disabled = state.chainRunPending;
+    button.textContent = buttonLabel;
+    button.setAttribute("aria-busy", String(state.chainRunPending));
+  }
+  if (note) {
+    note.textContent = noteLabel;
+  }
+  applyStepState(stepTarget, stepTargetMode);
+  applyStepState(stepAssessment, stepAssessmentMode);
+  applyStepState(stepReview, stepReviewMode);
+}
+
 function renderInsightTabs() {
-  document.querySelectorAll("[data-insight-tab]").forEach((button) => {
+  const tabs = Array.from(document.querySelectorAll("[data-insight-tab]"));
+  const tabIds = tabs.map((button) => button.dataset.insightTab);
+  if (!tabIds.includes(state.insightTab)) {
+    state.insightTab = tabIds.includes("console") ? "console" : (tabIds[0] || "console");
+  }
+
+  tabs.forEach((button) => {
     button.classList.toggle("is-active", button.dataset.insightTab === state.insightTab);
   });
   document.querySelectorAll("[data-insight-panel]").forEach((panel) => {
@@ -179,13 +481,37 @@ function requestRangePassword() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const normalizedPath = normalizeRequestPath(path);
+  const requestUrl = normalizedPath.startsWith("/api/")
+    ? buildRequestUrl(normalizedPath, await resolveApiBase())
+    : buildRequestUrl(normalizedPath);
+  const response = await fetch(requestUrl, {
+    credentials: "same-origin",
     headers: {
       "Content-Type": "application/json",
       ...(options.headers || {})
     },
     ...options
   });
+
+  if (response.status === 401) {
+    let loginUrl = `/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`;
+    try {
+      const data = await response.json();
+      if (data?.login_url) {
+        loginUrl = data.login_url;
+      }
+    } catch (error) {
+      // Abaikan dan gunakan fallback login URL.
+    }
+    window.location.href = loginUrl;
+    throw new Error("Sesi login berakhir. Silakan masuk kembali.");
+  }
+
+  if (response.redirected && response.url.includes("/login")) {
+    window.location.href = response.url;
+    throw new Error("Sesi login berakhir. Silakan masuk kembali.");
+  }
 
   if (!response.ok) {
     let message = `HTTP ${response.status}`;
@@ -198,7 +524,20 @@ async function api(path, options = {}) {
     throw new Error(message);
   }
 
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    throw new Error("Respon backend tidak valid. Muat ulang halaman dan login kembali bila diperlukan.");
+  }
+
   return response.json();
+}
+
+async function apiOptional(path, fallback = null, options = {}) {
+  try {
+    return await api(path, options);
+  } catch (error) {
+    return fallback;
+  }
 }
 
 function groupModulesByPhase(modules) {
@@ -234,8 +573,1427 @@ function chipMarkup(items = [], className = "") {
   return items.map((item) => `<span class="${className}">${item}</span>`).join("");
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 function currentTargetValue() {
-  return ($("#targetInput")?.value || "TARGET").trim() || "TARGET";
+  return $("#targetInput")?.value?.trim() || "TARGET";
+}
+
+function selectedRiskMode() {
+  return riskModeForProfile(selectedModuleProfile());
+}
+
+function currentOperatorName() {
+  return $("#operatorNameInput")?.value?.trim() || "operator";
+}
+
+function currentTicketRef() {
+  return $("#ticketRefInput")?.value?.trim() || "";
+}
+
+function activeAssessmentRiskMode() {
+  return state.activeAssessment?.risk_mode || selectedRiskMode();
+}
+
+function riskModeForProfile(profile) {
+  if (profile === "deep") return "intrusive";
+  if (profile === "balanced") return "deep";
+  return "safe";
+}
+
+function profileForRiskMode(riskMode) {
+  if (riskMode === "intrusive") return "deep";
+  if (riskMode === "deep") return "balanced";
+  return "fast";
+}
+
+function currentTargetKind() {
+  return $("#targetKindSelect")?.value === "url" ? "url" : "ip";
+}
+
+const INTERACTIVE_TOOL_LABELS = new Set(["metasploit", "ssh", "smbclient", "rpcclient"]);
+
+function isInteractiveToolLabel(label = "") {
+  return INTERACTIVE_TOOL_LABELS.has(String(label || "").trim().toLowerCase());
+}
+
+function selectedChainPreset() {
+  return selectedRiskMode() === "intrusive" ? "intrusive-validation" : "full-chain-default";
+}
+
+function severityClass(label) {
+  const value = String(label || "info").toLowerCase();
+  if (value === "kritis") return "critical";
+  if (value === "tinggi") return "high";
+  if (value === "sedang") return "medium";
+  if (value === "rendah") return "low";
+  return "info";
+}
+
+function remediationPromptDefaults(findingId) {
+  const finding = (state.activeFindings || []).find((item) => item.id === findingId) || {};
+  const metadata = finding.metadata || {};
+  return {
+    owner: metadata.owner || "",
+    due_date: metadata.due_date || "",
+    sla: metadata.sla || ""
+  };
+}
+
+function renderApprovalsDashboard() {
+  const container = $("#approvalsDashboardList");
+  const label = $("#approvalsDashboardLabel");
+  if (!container) return;
+  if (label) label.textContent = "0 active / 0 expired";
+  container.innerHTML = '<p class="empty-jobs">Approval flow nonaktif untuk workflow harian.</p>';
+}
+
+function renderAssessmentSummary() {
+  const container = $("#assessmentSummary");
+  if (!container) return;
+  const assessment = state.activeAssessment;
+  if (!assessment) {
+    container.textContent = "Belum ada assessment aktif.";
+    return;
+  }
+
+  const recommendations = state.activeRecommendations?.recommended_modules || [];
+  const detail = state.activeAssessmentDetail || {};
+  const severitySummary = state.activeFindingSummary?.severity_summary || {};
+  const diffSummary = detail.diff_summary || {};
+  const remediationSummary = detail.remediation_summary || {};
+  const driftSummary = detail.drift_summary || {};
+  const severityMarkup = Object.entries(severitySummary)
+    .filter(([, count]) => Number(count || 0) > 0)
+    .map(([label, count]) => `<span class="severity-pill severity-${severityClass(label)}">${label}: ${count}</span>`)
+    .join(" ") || '<span class="severity-pill severity-info">Belum ada finding</span>';
+  const recommendationMarkup = recommendations.length
+    ? `<ul>${recommendations.map((item) => `<li><strong>${item.phase_label}</strong> - ${item.title} <em>(${item.risk_class})</em></li>`).join("")}</ul>`
+    : "<div>Tidak ada rekomendasi tambahan. Coverage assessment sudah penuh atau belum ada data.</div>";
+  container.innerHTML = `
+    <div><strong>ID:</strong> ${assessment.id}</div>
+    <div><strong>Target:</strong> ${assessment.target}</div>
+    <div><strong>Target Kind:</strong> ${assessment.target_kind || "ip"}</div>
+    <div><strong>Mode:</strong> ${assessment.risk_mode}</div>
+    <div><strong>Operator:</strong> ${assessment.operator_name}</div>
+    <div><strong>Ticket:</strong> ${assessment.ticket_ref || "-"}</div>
+    <div><strong>Workspace:</strong> ${detail.workspace || assessment.metadata?.workspace || "-"}</div>
+    <div><strong>Jobs terkait:</strong> ${detail.job_count || 0}</div>
+    <div><strong>Coverage:</strong> ${state.activeRecommendations?.completed_modules || 0}/${state.activeRecommendations?.total_chain_modules || 0}</div>
+    <div><strong>Normalized findings:</strong> ${detail.finding_count || 0}</div>
+    <div><strong>Severity summary:</strong> ${severityMarkup}</div>
+    <div><strong>Diff vs assessment sebelumnya:</strong> new ${diffSummary.new || 0}, recurring ${diffSummary.recurring || 0}, resolved ${diffSummary.resolved || 0}</div>
+    <div><strong>Drift exposure:</strong> port baru ${driftSummary.open_ports?.new || 0}, path baru ${driftSummary.paths?.new || 0}, subdomain/DNS baru ${(driftSummary.subdomains?.new || 0) + (driftSummary.dns_records?.new || 0)}</div>
+    <div><strong>Remediation tracking:</strong> owner ${remediationSummary.assigned || 0}, due date ${remediationSummary.with_due_date || 0}, overdue ${remediationSummary.overdue_open || 0}</div>
+    <div><strong>Next recommended modules:</strong>${recommendationMarkup}</div>
+  `;
+}
+
+function renderAssessmentFindings() {
+  const container = $("#assessmentFindings");
+  const label = $("#assessmentFindingsLabel");
+  if (!container) return;
+  const findings = Array.isArray(state.activeFindings) ? state.activeFindings : [];
+  const diff = state.activeDiff || { new: [], recurring: [], resolved: [] };
+  const newIds = new Set((diff.new || []).map((item) => item.id));
+  const recurringIds = new Set((diff.recurring || []).map((item) => item.id));
+  if (label) label.textContent = `${findings.length} findings`;
+  if (!findings.length) {
+    container.innerHTML = '<p class="empty-jobs">Belum ada normalized finding pada assessment aktif.</p>';
+    return;
+  }
+  container.innerHTML = findings.map((finding) => {
+    const diffLabel = newIds.has(finding.id) ? 'new' : recurringIds.has(finding.id) ? 'recurring' : 'current';
+    return `
+    <article class="evidence-item severity-border-${severityClass(finding.severity)}">
+      <div class="evidence-head finding-head-wrap">
+        <strong>${finding.title}</strong>
+        <div class="finding-pill-row">
+          <span class="severity-pill severity-${severityClass(finding.severity)}">${finding.severity}</span>
+          <span class="severity-pill severity-info">${finding.status || 'open'}</span>
+          <span class="severity-pill severity-low">${diffLabel}</span>
+          <span class="severity-pill severity-medium">${(finding.metadata || {}).rule_id || 'generic'}</span>
+        </div>
+      </div>
+      <p class="evidence-detail">${Array.isArray(finding.description) && finding.description.length ? finding.description[0] : 'Temuan telah dinormalisasi dari evidence assessment.'}</p>
+      ${(Array.isArray(finding.evidence_lines) ? finding.evidence_lines : []).slice(0, 3).map((line) => `<p class="evidence-detail evidence-detail-code">- ${line}</p>`).join('')}
+      <div class="finding-actions-row">
+        <button class="ghost-button compact" type="button" data-finding-action="open" data-finding-id="${finding.id}">Open</button>
+        <button class="ghost-button compact" type="button" data-finding-action="accepted-risk" data-finding-id="${finding.id}">Accepted Risk</button>
+        <button class="ghost-button compact" type="button" data-finding-action="mitigated" data-finding-id="${finding.id}">Mitigated</button>
+        <button class="ghost-button compact" type="button" data-finding-action="false-positive" data-finding-id="${finding.id}">False Positive</button>
+      </div>
+      <small>${finding.phase_label || '-'} - ${finding.module_title || '-'} - owner: ${(finding.metadata || {}).owner || '-'} - due: ${(finding.metadata || {}).due_date || '-'} - sla: ${(finding.metadata || {}).sla || '-'} - note: ${(finding.metadata || {}).status_note || '-'}</small>
+    </article>`;
+  }).join('');
+}
+
+function renderApprovalQueue() {
+  const card = $("#approvalQueueCard");
+  const container = $("#approvalQueueList");
+  const label = $("#approvalQueueLabel");
+  if (!container) return;
+  if (label) label.textContent = "0 pending";
+  if (card) card.classList.add("hidden");
+  container.innerHTML = '<p class="empty-jobs">Approval queue dinonaktifkan.</p>';
+}
+
+function formatDateLabel(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("id-ID", {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function renderChainPresetSelect() {
+  const select = $("#chainPresetSelect");
+  if (!select) return;
+  const presets = Array.isArray(state.chainPresets) ? state.chainPresets : [];
+  if (!presets.length) {
+    select.innerHTML = '<option value="full-chain-default">full-chain-default</option>';
+    return;
+  }
+  const activeValue = selectedChainPreset();
+  select.innerHTML = presets.map((preset) => `
+    <option value="${preset.id}" ${preset.id === activeValue ? "selected" : ""}>${preset.label}</option>
+  `).join("");
+}
+
+function renderChainPresetList() {
+  const container = $("#chainPresetList");
+  if (!container) return;
+  const presets = Array.isArray(state.chainPresets) ? state.chainPresets : [];
+  if (!presets.length) {
+    container.innerHTML = '<p class="empty-jobs">Belum ada chain preset.</p>';
+    return;
+  }
+  const activePreset = selectedChainPreset();
+  container.innerHTML = presets.map((preset) => `
+    <article class="preset-item${preset.id === activePreset ? " is-active" : ""}">
+      <div class="preset-item-head">
+        <strong>${preset.label}</strong>
+        <span class="severity-pill severity-info">${preset.recommended_risk_mode || "safe"}</span>
+      </div>
+      <p>${preset.description}</p>
+      <div class="preset-item-meta">
+        <span class="module-chip module-chip-muted">${preset.id}</span>
+        <span class="module-chip module-chip-soft">${(preset.priority_module_ids || []).length} priority modules</span>
+      </div>
+    </article>
+  `).join("");
+}
+
+function toolCategoryForLabel(label) {
+  const tool = String(label || "").toLowerCase();
+  if (["nmap", "masscan", "rustscan", "naabu", "ncat", "socat"].some((item) => tool.includes(item))) return "Discovery";
+  if (["subfinder", "dnsx", "dnsrecon", "fierce", "chaos", "amass", "dig", "shuffledns"].some((item) => tool.includes(item))) return "DNS & Surface";
+  if (["httpx", "whatweb", "wappalyzer", "nikto", "nuclei", "ffuf", "gobuster", "katana", "urlscan", "curl"].some((item) => tool.includes(item))) return "Web Assessment";
+  if (["sqlmap", "dalfox", "xsstrike", "commix", "jwt", "wpscan"].some((item) => tool.includes(item))) return "Validation";
+  if (["hydra", "medusa", "crowbar", "kerbrute", "john", "hashcat", "ncrack", "patator"].some((item) => tool.includes(item))) return "Credential";
+  if (["metasploit", "searchsploit", "beef", "bettercap", "responder", "mitm6", "bloodhound", "impacket", "enum4linux", "mimikatz", "proxychains", "chisel", "ssh", "smbclient", "ldapsearch", "rpcclient"].some((item) => tool.includes(item))) return "Post Exploitation";
+  if (["openssl", "sslyze", "tcpdump", "wireshark", "zeek", "suricata", "sigma", "sysmon", "yara", "strings", "file", "sha256sum"].some((item) => tool.includes(item))) return "Detection & Forensics";
+  if (["jq", "pandoc", "graphviz", "markdown", "mailparser", "swaks", "otp-review", "killchain", "ngrok"].some((item) => tool.includes(item))) return "Utility";
+  return "Other";
+}
+
+function toolPurposeCopy(category) {
+  const mapping = {
+    "Discovery": "Dipakai untuk memastikan host hidup, membuka port map, dan membangun baseline exposure sebelum validasi lebih dalam.",
+    "DNS & Surface": "Dipakai saat kita perlu memperluas scope permukaan, host, subdomain, atau jejak layanan yang terhubung ke target.",
+    "Web Assessment": "Dipakai untuk fingerprinting, crawling, content discovery, dan observasi misconfiguration web secara cepat.",
+    "Validation": "Dipakai ketika perlu menguji hipotesis temuan spesifik seperti injection, auth issue, atau komponen rentan.",
+    "Credential": "Dipakai untuk mengukur risiko paparan kredensial atau validasi account attack path secara terkontrol.",
+    "Post Exploitation": "Dipakai pada fase lanjutan untuk eksploitasi, pivot, lateral movement, atau emulasi attacker pasca-akses.",
+    "Detection & Forensics": "Dipakai untuk melihat jejak, paket, indikator pertahanan, dan artefak yang berguna untuk hunting atau evidence.",
+    "Utility": "Dipakai sebagai alat bantu pengolahan data, dokumentasi, parsing, dan workflow pendukung operator.",
+    "Other": "Dipakai sebagai tool pendukung yang belum masuk kelompok dominan tertentu."
+  };
+  return mapping[category] || mapping.Other;
+}
+
+function toolUsageModules(label) {
+  return (state.modules || [])
+    .filter((module) => Array.isArray(module.tooling) && module.tooling.includes(label))
+    .map((module) => ({
+      id: module.id,
+      title: module.title,
+      phaseId: module.phase_id,
+      phase: module.phase_label,
+      risk: module.risk
+    }));
+}
+
+function selectedToolSortMode() {
+  return $("#toolSortSelect")?.value || state.toolSortMode || "usage";
+}
+
+function filteredToolCatalogEntries() {
+  const toolMap = state.toolsStatus?.tools || {};
+  const rows = Array.isArray(state.toolingCatalog) && state.toolingCatalog.length
+    ? state.toolingCatalog.map((entry) => [entry.label, entry.status || toolMap[entry.label] || {}])
+    : Object.entries(toolMap);
+
+  const matchesFilter = (status) => {
+    if (state.toolStatusFilter === "installed") return status?.installed === true;
+    if (state.toolStatusFilter === "missing") return status?.installed === false;
+    if (state.toolStatusFilter === "conceptual") return status?.kind === "conceptual";
+    return true;
+  };
+
+  const matchesSearch = (label, status, category) => {
+    const needle = String(state.toolSearchQuery || "").trim().toLowerCase();
+    if (!needle) return true;
+    const haystack = [label, category, status?.command, status?.kind].filter(Boolean).join(" ").toLowerCase();
+    return haystack.includes(needle);
+  };
+
+  return rows
+    .map(([label, status]) => ({ label, status, category: toolCategoryForLabel(label) }))
+    .filter((entry) => matchesFilter(entry.status) && matchesSearch(entry.label, entry.status, entry.category))
+    .sort((a, b) => {
+      const aUsage = toolUsageModules(a.label).length;
+      const bUsage = toolUsageModules(b.label).length;
+      const installedRank = (entry, mode) => {
+        if (mode === "missing") return entry.status?.installed === false ? 0 : entry.status?.kind === "conceptual" ? 2 : 1;
+        return entry.status?.installed === true ? 0 : entry.status?.kind === "conceptual" ? 2 : 1;
+      };
+      const sortMode = selectedToolSortMode();
+      if (sortMode === "usage") return bUsage - aUsage || a.category.localeCompare(b.category) || a.label.localeCompare(b.label);
+      if (sortMode === "installed" || sortMode === "missing") {
+        return installedRank(a, sortMode) - installedRank(b, sortMode) || bUsage - aUsage || a.label.localeCompare(b.label);
+      }
+      return a.label.localeCompare(b.label);
+    });
+}
+
+function toolReferenceContext(status) {
+  const target = currentTargetValue();
+  const domainTarget = currentTargetKind() === "ip" || currentTargetKind() === "cidr" ? target : target;
+  const httpTarget = currentTargetKind() === "url"
+    ? target
+    : `http://${currentTargetKind() === "ip" || currentTargetKind() === "cidr" ? target : domainTarget}`;
+  return {
+    target,
+    domainTarget,
+    httpTarget,
+    command: status?.command || "tool",
+    riskMode: selectedRiskMode()
+  };
+}
+
+function fallbackToolReference(label, status, category) {
+  const context = toolReferenceContext(status);
+  const primaryCommand = status?.command || label;
+  const usageModules = toolUsageModules(label);
+  const usageCopy = usageModules.length
+    ? `${usageModules.length} modul memakai ${label}. Fokusnya ada pada fase ${[...new Set(usageModules.map((item) => item.phase))].join(", ")}.`
+    : `${label} belum dipetakan langsung ke modul katalog, jadi paling pas dipakai sebagai alat bantu eksplorasi atau verifikasi manual.`;
+
+  const categoryPlaybooks = {
+    "Discovery": [
+      { title: "Quick Discovery", tone: "baseline", description: "Mulai dengan enumerasi ringan untuk memastikan host dan port utama.", command: `${primaryCommand} ${context.target}` },
+      { title: "Safer Validation", tone: "safe", description: "Lihat opsi aman sebelum menambah agresivitas scan.", command: `${primaryCommand} --help` }
+    ],
+    "DNS & Surface": [
+      { title: "Quick Enumeration", tone: "baseline", description: "Mulai dari domain aktif lalu perluas permukaan secara bertahap.", command: `${primaryCommand} -d ${context.domainTarget}` },
+      { title: "Review Options", tone: "safe", description: "Cek syntax dan mode yang tersedia sebelum menjalankan wordlist besar.", command: `${primaryCommand} --help` }
+    ],
+    "Web Assessment": [
+      { title: "Quick Baseline", tone: "baseline", description: "Lakukan fingerprinting web ringan pada target aktif.", command: `${primaryCommand} ${context.httpTarget}` },
+      { title: "Review Options", tone: "safe", description: "Pastikan flag yang dipakai sesuai scope dan risk mode.", command: `${primaryCommand} --help` }
+    ],
+    "Validation": [
+      { title: "Targeted Check", tone: "baseline", description: "Gunakan hanya setelah ada hipotesis temuan yang cukup kuat.", command: `${primaryCommand} --help` },
+      { title: "Operator Guardrail", tone: "safe", description: "Cek lagi approval dan risk mode sebelum validasi agresif.", command: `echo "Risk mode: ${context.riskMode}"` }
+    ],
+    "Credential": [
+      { title: "Dry Review", tone: "baseline", description: "Mulai dari mode bantuan atau audit lokal sebelum brute-force terkontrol.", command: `${primaryCommand} --help` },
+      { title: "Operator Guardrail", tone: "safe", description: "Pastikan lockout policy target dipahami sebelum validasi kredensial.", command: `echo "Review lockout policy sebelum memakai ${label}"` }
+    ],
+    "Post Exploitation": [
+      { title: "Operator Prep", tone: "baseline", description: "Tool fase lanjutan perlu konteks akses, scope, dan approval yang jelas.", command: `${primaryCommand} --help` },
+      { title: "Guardrail", tone: "safe", description: "Gunakan hanya saat assessment memang mengizinkan validasi lanjut.", command: `echo "Pastikan approval tersedia untuk ${label}"` }
+    ],
+    "Detection & Forensics": [
+      { title: "Quick Collection", tone: "baseline", description: "Ambil baseline artefak atau traffic lebih dulu sebelum analisis mendalam.", command: `${primaryCommand} --help` },
+      { title: "Operator Note", tone: "safe", description: "Verifikasi format output agar mudah diimpor ke evidence parser.", command: `echo "Simpan output ${label} ke workspace assessment"` }
+    ],
+    "Utility": [
+      { title: "Quick Use", tone: "baseline", description: "Tool utilitas biasanya dipakai sebagai pendukung parsing, relay, atau dokumentasi.", command: `${primaryCommand} --help` },
+      { title: "Workflow Hint", tone: "safe", description: "Cek contoh command dan integrasikan ke module output bila perlu.", command: `${primaryCommand} --version` }
+    ],
+    "Other": [
+      { title: "Primary Command", tone: "baseline", description: "Mulai dari alias utama yang terdeteksi di backend.", command: primaryCommand },
+      { title: "Review Options", tone: "safe", description: "Buka bantuan tool untuk melihat mode yang tersedia.", command: `${primaryCommand} --help` }
+    ]
+  };
+
+  return {
+    commands: categoryPlaybooks[category] || categoryPlaybooks.Other,
+    usage: usageCopy,
+    notes: [
+      "Sesuaikan wordlist, rate, dan concurrency dengan scope lab.",
+      "Simpan output mentah ke workspace assessment agar evidence tetap dapat ditelusuri.",
+      status?.installed === false ? "Status backend menunjukkan tool ini belum tersedia di environment." : "Status backend menunjukkan binary terdeteksi atau tool bersifat wrapper."
+    ]
+  };
+}
+
+function toolReferenceData(label, status) {
+  const tool = String(label || "").toLowerCase();
+  const category = toolCategoryForLabel(label);
+  const context = toolReferenceContext(status);
+  const explicit = {
+    nmap: {
+      commands: [
+        { title: "Quick Port Baseline", tone: "baseline", description: "Cocok untuk melihat port penting lebih dulu tanpa sweep penuh.", command: `nmap -Pn -sV -T4 ${context.target}` },
+        { title: "Safe Web Triage", tone: "safe", description: "Kalau scope hati-hati, fokuskan ke port web dan simpan output normal.", command: `nmap -Pn -p 80,443,8080,8443 --open -sV ${context.target} -oN nmap-web.txt` },
+        { title: "Deep Service Review", tone: "advanced", description: "Pakai hanya saat butuh service fingerprint lebih lengkap.", command: `nmap -Pn -sC -sV -O ${context.target} -oA nmap-deep` }
+      ],
+      notes: ["Mulai dari `-Pn` bila ICMP diblokir.", "Gunakan `-oA` saat hasil akan dipakai modul lain atau dibandingkan antar assessment.", "Jaga `-T4` hanya untuk subnet yang memang diizinkan."]
+    },
+    masscan: {
+      commands: [
+        { title: "Fast Port Sweep", tone: "baseline", description: "Untuk baseline port exposure dengan rate terkontrol.", command: `masscan ${context.target} -p1-1000 --rate 1000` },
+        { title: "Conservative Rate", tone: "safe", description: "Turunkan laju ketika target sensitif atau jaringan terbatas.", command: `masscan ${context.target} -p80,443,445,3389 --rate 300` }
+      ],
+      notes: ["Masscan cepat tetapi mudah bising.", "Selalu turunkan `--rate` pada scope internal yang sensitif.", "Validasi hasil penting dengan `nmap`."]
+    },
+    rustscan: {
+      commands: [
+        { title: "Fast Port Discovery", tone: "baseline", description: "Bagus untuk buka peta port cepat lalu chaining ke nmap.", command: `rustscan -a ${context.target} --ulimit 5000` },
+        { title: "Focused Range", tone: "safe", description: "Batasi port bila target tidak butuh sweep penuh.", command: `rustscan -a ${context.target} -r 1-1000` }
+      ],
+      notes: ["Rustscan cocok sebagai pre-scan.", "Bila ada hasil menarik, lanjutkan ke `nmap -sV`."]
+    },
+    subfinder: {
+      commands: [
+        { title: "Passive Subdomain Enum", tone: "baseline", description: "Mulai dari enumerasi pasif untuk memperluas permukaan domain.", command: `subfinder -d ${context.domainTarget} -silent` },
+        { title: "Save Resolved Hosts", tone: "safe", description: "Simpan hasil yang akan dipakai httpx atau dnsx.", command: `subfinder -d ${context.domainTarget} -all -o subfinder.txt` }
+      ],
+      notes: ["Cocok dikombinasikan dengan `httpx` atau `dnsx`.", "Gunakan mode pasif lebih dulu untuk mengurangi noise."]
+    },
+    amass: {
+      commands: [
+        { title: "Passive Mapping", tone: "baseline", description: "Bangun baseline permukaan subdomain dan ASN secara bertahap.", command: `amass enum -passive -d ${context.domainTarget}` },
+        { title: "Deeper Enum", tone: "advanced", description: "Lebih lengkap, tetapi lebih berat dan perlu review sumber data.", command: `amass enum -src -ip -d ${context.domainTarget} -o amass.txt` }
+      ],
+      notes: ["Bagus untuk ekspansi asset.", "Hindari mode terlalu agresif bila belum ada kebutuhan."]
+    },
+    dnsx: {
+      commands: [
+        { title: "Resolve Candidate Hosts", tone: "baseline", description: "Validasi host hasil enumerasi agar cepat terlihat yang hidup.", command: `dnsx -l subfinder.txt -resp -a -aaaa -cname` },
+        { title: "Direct Probe", tone: "safe", description: "Pakai untuk domain tunggal saat perlu cek record dasar.", command: `echo ${context.domainTarget} | dnsx -silent -resp` }
+      ],
+      notes: ["Sangat cocok sebagai filter setelah subdomain enum.", "Simpan hasil resolved untuk pipeline berikutnya."]
+    },
+    httpx: {
+      commands: [
+        { title: "Quick HTTP Probe", tone: "baseline", description: "Cek host mana yang benar-benar menyajikan service web.", command: `echo ${context.domainTarget} | httpx -title -tech-detect -status-code` },
+        { title: "Batch From File", tone: "safe", description: "Pakailah file host hasil subfinder agar alur kerja lebih rapi.", command: `httpx -l subfinder.txt -title -tech-detect -follow-redirects -o httpx.txt` }
+      ],
+      notes: ["Sangat baik untuk triage awal sebelum nuclei atau ffuf.", "Gunakan output file agar bisa dipakai ulang."]
+    },
+    nuclei: {
+      commands: [
+        { title: "Quick Exposure Check", tone: "baseline", description: "Jalankan template severity rendah-menengah lebih dulu.", command: `nuclei -u ${context.httpTarget} -severity low,medium,high` },
+        { title: "Safe Template Scope", tone: "safe", description: "Batasi template agar tetap relevan dengan stack target.", command: `nuclei -u ${context.httpTarget} -tags exposure,misconfig -rl 50` },
+        { title: "Batch Scan", tone: "advanced", description: "Jalankan terhadap daftar host setelah triage web selesai.", command: `nuclei -l httpx.txt -severity medium,high,critical -o nuclei.txt` }
+      ],
+      notes: ["Selalu review template yang dipakai.", "Batasi rate dengan `-rl` di lingkungan sensitif.", "Validasi finding penting secara manual."]
+    },
+    ffuf: {
+      commands: [
+        { title: "Directory Discovery", tone: "baseline", description: "Gunakan untuk menemukan route dan endpoint umum.", command: `ffuf -u ${context.httpTarget}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc all -fs 0` },
+        { title: "Conservative Content Fuzz", tone: "safe", description: "Mulai dengan thread rendah dan filter status umum.", command: `ffuf -u ${context.httpTarget}/FUZZ -w /usr/share/wordlists/dirb/common.txt -t 20 -fc 404` }
+      ],
+      notes: ["Perhatikan baseline size/words/lines agar filtering akurat.", "Mulai dengan thread rendah pada aplikasi rapuh."]
+    },
+    gobuster: {
+      commands: [
+        { title: "Dir Enumeration", tone: "baseline", description: "Versi aman untuk target yang memberi respons wildcard atau fallback page.", command: `gobuster dir -u ${context.httpTarget} -w /usr/share/wordlists/dirb/common.txt -k --wildcard` },
+        { title: "Vhost Enumeration", tone: "advanced", description: "Pakai saat ada indikasi virtual host tambahan.", command: `gobuster vhost -u ${context.httpTarget} -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt --append-domain` }
+      ],
+      notes: ["Jika server membalas 200 untuk path acak, gunakan `--wildcard` atau `--exclude-length <ukuran>`.", "Untuk baseline yang lebih stabil di target wildcard, prioritaskan ffuf dengan auto-calibration (`-ac`)."]
+    },
+    katana: {
+      commands: [
+        { title: "Quick Crawl", tone: "baseline", description: "Bangun daftar URL cepat untuk dipakai tool lain.", command: `katana -u ${context.httpTarget} -d 2 -silent` },
+        { title: "Save URLs", tone: "safe", description: "Simpan endpoint hasil crawl untuk workflow berikutnya.", command: `katana -u ${context.httpTarget} -d 3 -o katana.txt` }
+      ],
+      notes: ["Cocok dipakai sebelum dalfox atau nuclei.", "Batasi depth supaya crawl tetap terkendali."]
+    },
+    whatweb: {
+      commands: [
+        { title: "Fingerprint Web Stack", tone: "baseline", description: "Lihat teknologi web yang muncul tanpa crawling agresif.", command: `whatweb ${context.httpTarget}` },
+        { title: "Verbose Review", tone: "safe", description: "Tambah detail hanya bila memang diperlukan.", command: `whatweb -a 3 ${context.httpTarget}` }
+      ],
+      notes: ["Gunakan untuk baseline technology stack.", "Temuan fingerprint sebaiknya divalidasi silang dengan header atau source HTML."]
+    },
+    nikto: {
+      commands: [
+        { title: "Quick Web Misconfig Review", tone: "baseline", description: "Cocok untuk baseline exposure di web server yang sudah jelas scope-nya.", command: `nikto -h ${context.httpTarget}` },
+        { title: "Port-Specific Check", tone: "safe", description: "Pakai saat service web ada di port non-standar.", command: `nikto -h ${context.target} -p 8080` }
+      ],
+      notes: ["Nikto cukup noisy, jadi pakai setelah web target dipastikan relevan.", "Hasil perlu divalidasi manual."]
+    },
+    curl: {
+      commands: [
+        { title: "Header Triage", tone: "baseline", description: "Paling cepat untuk melihat response dan header inti.", command: `curl -I ${context.httpTarget}` },
+        { title: "Verbose Request", tone: "safe", description: "Lihat redirect, TLS, dan negotiation saat debugging.", command: `curl -vk ${context.httpTarget}` }
+      ],
+      notes: ["Sangat berguna untuk verifikasi manual hasil tool lain.", "Simpan request penting ke evidence."]
+    },
+    sqlmap: {
+      commands: [
+        { title: "Targeted Param Check", tone: "baseline", description: "Gunakan hanya pada URL/parameter yang sudah punya indikasi injeksi.", command: `sqlmap -u "${context.httpTarget}/item?id=1" -p id --batch --risk=1 --level=1` },
+        { title: "Cookie Session Validation", tone: "advanced", description: "Pakai bila endpoint butuh autentikasi dan approval sudah jelas.", command: `sqlmap -u "${context.httpTarget}/app.php?id=1" --cookie="SESSION=lab" --batch --risk=2 --level=3` }
+      ],
+      notes: ["Jangan dipakai membabi buta ke semua URL.", "Selalu mulai dari risk dan level rendah.", "Pastikan approval untuk pengujian injection aktif."]
+    },
+    dalfox: {
+      commands: [
+        { title: "Single URL XSS Check", tone: "baseline", description: "Cocok untuk parameter yang sudah dicurigai reflektif.", command: `dalfox url "${context.httpTarget}/search?q=test"` },
+        { title: "Pipe From URL List", tone: "advanced", description: "Jalankan setelah ada daftar endpoint hasil crawl.", command: `cat katana.txt | dalfox pipe` }
+      ],
+      notes: ["Sangat efektif setelah crawling.", "Review payload dan hasil PoC sebelum menyimpulkan impact."]
+    },
+    xsstrike: {
+      commands: [
+        { title: "Focused XSS Test", tone: "baseline", description: "Alternatif saat ingin eksplor payload XSS lebih interaktif.", command: `python xsstrike.py -u "${context.httpTarget}/search?q=test"` },
+        { title: "POST Data Review", tone: "advanced", description: "Pakai untuk parameter POST yang sudah teridentifikasi.", command: `python xsstrike.py -u ${context.httpTarget}/login --data "username=test&next=/home"` }
+      ],
+      notes: ["Lebih cocok untuk validasi tertarget.", "Jangan mulai dari seluruh aplikasi."]
+    },
+    wpscan: {
+      commands: [
+        { title: "WordPress Baseline", tone: "baseline", description: "Gunakan saat fingerprint menunjukkan WordPress.", command: `wpscan --url ${context.httpTarget} --enumerate vp,vt,cb` },
+        { title: "API Token Mode", tone: "advanced", description: "Tambah konteks plugin/theme exposure bila token tersedia.", command: `wpscan --url ${context.httpTarget} --api-token YOUR_TOKEN` }
+      ],
+      notes: ["Jalankan hanya bila CMS WordPress terkonfirmasi.", "Batasi enumerasi sesuai kebutuhan."]
+    },
+    hydra: {
+      commands: [
+        { title: "Controlled Credential Check", tone: "baseline", description: "Validasi kecil pada service yang memang diizinkan untuk diuji.", command: `hydra -L users.txt -P passwords.txt ssh://${context.target} -t 4 -f` },
+        { title: "HTTP Form Validation", tone: "advanced", description: "Gunakan bila login form sudah dipahami dan lockout policy aman.", command: `hydra -L users.txt -P passwords.txt ${context.domainTarget} http-post-form "/login:user=^USER^&pass=^PASS^:F=invalid"` }
+      ],
+      notes: ["Wajib pahami lockout policy lebih dulu.", "Mulai dengan thread rendah dan sample credential kecil."]
+    },
+    medusa: {
+      commands: [
+        { title: "Service Login Validation", tone: "baseline", description: "Alternatif brute-force terkontrol untuk service tertentu.", command: `medusa -h ${context.target} -U users.txt -P passwords.txt -M ssh -t 4` },
+        { title: "Single User Audit", tone: "safe", description: "Lebih aman saat memvalidasi satu akun yang disetujui.", command: `medusa -h ${context.target} -u admin -P passwords.txt -M smbnt -t 2` }
+      ],
+      notes: ["Turunkan paralelisme di lingkungan sensitif.", "Utamakan validasi akun yang memang diizinkan."]
+    },
+    kerbrute: {
+      commands: [
+        { title: "User Enumeration", tone: "baseline", description: "Cocok untuk validasi user AD pada scope internal berizin.", command: `kerbrute userenum -d ${context.domainTarget} users.txt --dc ${context.target}` },
+        { title: "Password Spray", tone: "advanced", description: "Pakai sangat hati-hati dengan approval dan window yang disetujui.", command: `kerbrute passwordspray -d ${context.domainTarget} users.txt 'Spring2026!' --dc ${context.target}` }
+      ],
+      notes: ["Risiko lockout tinggi.", "Pastikan ada approval eksplisit sebelum spray."]
+    },
+    john: {
+      commands: [
+        { title: "Offline Hash Review", tone: "baseline", description: "Gunakan untuk audit hash yang sudah sah diperoleh.", command: `john hashes.txt --wordlist=/usr/share/wordlists/rockyou.txt` },
+        { title: "Show Cracked", tone: "safe", description: "Tampilkan hasil tanpa mengulang cracking.", command: `john --show hashes.txt` }
+      ],
+      notes: ["Cocok untuk validasi impact offline.", "Simpan hash source dan hasil crack secara terpisah."]
+    },
+    hashcat: {
+      commands: [
+        { title: "Offline Crack Baseline", tone: "baseline", description: "Mulai dari mode hash yang sudah pasti dan wordlist kecil.", command: `hashcat -m 1000 hashes.txt /usr/share/wordlists/rockyou.txt` },
+        { title: "Sessioned Run", tone: "advanced", description: "Gunakan session agar pekerjaan panjang bisa dilanjutkan.", command: `hashcat -m 1000 hashes.txt /usr/share/wordlists/rockyou.txt --session audit1 --status` }
+      ],
+      notes: ["Pastikan mode hash benar.", "Pantau penggunaan GPU/CPU agar tidak mengganggu host operator."]
+    },
+    responder: {
+      commands: [
+        { title: "LLMNR/NBT-NS Observe", tone: "baseline", description: "Gunakan pada segment internal yang memang mengizinkan emulasi poisoned response.", command: `responder -I eth0 -dwv` },
+        { title: "Analyze Mode", tone: "safe", description: "Mode analisis lebih aman untuk memahami noise lebih dulu.", command: `responder -I eth0 -A` }
+      ],
+      notes: ["Jangan jalankan di luar segment lab yang disetujui.", "Mode analyze cocok sebagai langkah awal."]
+    },
+    bloodhound: {
+      commands: [
+        { title: "Open GUI", tone: "baseline", description: "Pakai setelah data AD berhasil dikumpulkan.", command: `bloodhound` },
+        { title: "Prep Imported Data", tone: "safe", description: "Pastikan collector output tersimpan rapi sebelum analisis.", command: `echo "Import ZIP collector ke BloodHound UI"` }
+      ],
+      notes: ["BloodHound lebih kuat setelah data collector lengkap.", "Simpan snapshot graph per assessment."]
+    },
+    "bloodhound-python": {
+      commands: [
+        { title: "Collect AD Graph Data", tone: "baseline", description: "Kumpulkan data relasi AD secara terkontrol.", command: `bloodhound-python -d ${context.domainTarget} -u USER -p PASS -ns ${context.target} -c All` },
+        { title: "Stealthier Collection", tone: "safe", description: "Batasi collection bila hanya butuh subset hubungan.", command: `bloodhound-python -d ${context.domainTarget} -u USER -p PASS -ns ${context.target} -c DCOnly` }
+      ],
+      notes: ["Gunakan akun yang memang diizinkan.", "Sesuaikan collection set dengan tujuan assessment."]
+    },
+    enum4linux: {
+      commands: [
+        { title: "SMB Enum Baseline", tone: "baseline", description: "Mulai dari enumerasi SMB standar pada host yang relevan.", command: `enum4linux -a ${context.target}` }
+      ],
+      notes: ["Bagus untuk triage awal Windows share exposure."]
+    },
+    "enum4linux-ng": {
+      commands: [
+        { title: "SMB Enum Baseline", tone: "baseline", description: "Versi lebih modern untuk enumerasi SMB.", command: `enum4linux-ng -A ${context.target}` }
+      ],
+      notes: ["Mulai dari mode all bila scope host tunggal jelas."]
+    },
+    impacket: {
+      commands: [
+        { title: "List Available Examples", tone: "baseline", description: "Impacket adalah koleksi banyak script; mulai dengan melihat contoh yang tersedia.", command: `ls /usr/share/doc/python3-impacket/examples` },
+        { title: "Common SMB Exec Pattern", tone: "advanced", description: "Gunakan hanya bila approval pasca-akses sudah jelas.", command: `python /usr/share/doc/python3-impacket/examples/psexec.py DOMAIN/user:pass@${context.target}` }
+      ],
+      notes: ["Impacket bukan satu binary tunggal.", "Pilih script sesuai tujuan: enum, exec, relay, atau kerberos."]
+    },
+    smbclient: {
+      commands: [
+        { title: "Anonymous Share Check", tone: "baseline", description: "Cek apakah ada share terbuka tanpa kredensial.", command: `smbclient -L //${context.target}/ -N` },
+        { title: "Authenticated Browse", tone: "safe", description: "Gunakan akun audit bila akses anonim ditolak.", command: `smbclient //${context.target}/share -U DOMAIN\\\\user` }
+      ],
+      notes: ["Simpan daftar share yang terpapar ke evidence.", "Validasi akses tulis dengan sangat hati-hati."]
+    },
+    ldapsearch: {
+      commands: [
+        { title: "Anonymous LDAP Query", tone: "baseline", description: "Validasi cepat apakah LDAP mengizinkan query dasar.", command: `ldapsearch -x -H ldap://${context.target} -s base` },
+        { title: "Domain User Query", tone: "advanced", description: "Pakai untuk enumerasi tertarget bila bind account tersedia.", command: `ldapsearch -x -H ldap://${context.target} -D "user@${context.domainTarget}" -W -b "dc=target,dc=lab"` }
+      ],
+      notes: ["Sesuaikan base DN dengan domain aktual.", "Jangan simpan password bind di command history."]
+    },
+    rpcclient: {
+      commands: [
+        { title: "Null Session Check", tone: "baseline", description: "Lihat apakah RPC mengizinkan enumerasi tanpa auth.", command: `rpcclient -U '' -N ${context.target} -c enumdomusers` },
+        { title: "Authenticated Query", tone: "safe", description: "Pakai akun audit untuk query lebih stabil.", command: `rpcclient -U DOMAIN\\\\user%Passw0rd ${context.target} -c enumdomusers` }
+      ],
+      notes: ["Query RPC klasik masih berguna untuk triage Windows.", "Perhatikan format escape domain user di shell."]
+    },
+    ssh: {
+      commands: [
+        { title: "Safe Banner Review", tone: "baseline", description: "Mulai dari koneksi interaktif biasa untuk melihat banner dan host key.", command: `ssh user@${context.target}` },
+        { title: "Non-Interactive Check", tone: "safe", description: "Jalankan command ringan untuk verifikasi akses yang sudah sah.", command: `ssh user@${context.target} "whoami && hostname"` }
+      ],
+      notes: ["Jangan bypass host key di luar kebutuhan lab.", "Gunakan akun audit yang disetujui."]
+    },
+    openssl: {
+      commands: [
+        { title: "TLS Handshake Review", tone: "baseline", description: "Lihat sertifikat dan negosiasi TLS dengan cepat.", command: `openssl s_client -connect ${context.target}:443 -servername ${context.domainTarget}` },
+        { title: "Certificate Extract", tone: "safe", description: "Ambil chain sertifikat untuk dianalisis lebih lanjut.", command: `echo | openssl s_client -connect ${context.target}:443 -servername ${context.domainTarget} 2>/dev/null | openssl x509 -noout -text` }
+      ],
+      notes: ["Cocok untuk verifikasi manual hasil sslyze atau scanner lain."]
+    },
+    sslyze: {
+      commands: [
+        { title: "TLS Config Audit", tone: "baseline", description: "Audit cepat konfigurasi TLS pada endpoint web.", command: `sslyze --regular ${context.target}:443` },
+        { title: "SNI-Aware Audit", tone: "safe", description: "Tambahkan hostname jika sertifikat bergantung pada SNI.", command: `sslyze --regular --sni ${context.domainTarget} ${context.target}:443` }
+      ],
+      notes: ["Gunakan untuk baseline cryptography posture.", "Simpan output saat perlu dibandingkan antar assessment."]
+    },
+    dig: {
+      commands: [
+        { title: "Quick DNS Lookup", tone: "baseline", description: "Lihat record dasar domain target.", command: `dig ${context.domainTarget}` },
+        { title: "Specific Record Check", tone: "safe", description: "Gunakan bila butuh MX/TXT/NS secara tertarget.", command: `dig ${context.domainTarget} TXT +short` }
+      ],
+      notes: ["Sangat cocok untuk validasi manual hasil enumerasi."]
+    },
+    tcpdump: {
+      commands: [
+        { title: "Interface Capture", tone: "baseline", description: "Tangkap traffic terbatas untuk bukti atau triage protokol.", command: `tcpdump -ni eth0 host ${context.target}` },
+        { title: "Write PCAP", tone: "safe", description: "Simpan capture agar bisa dianalisis ulang di Wireshark.", command: `tcpdump -ni eth0 host ${context.target} -w capture-${context.target}.pcap` }
+      ],
+      notes: ["Selalu batasi filter agar capture tidak berlebihan.", "Pastikan penyimpanan PCAP sesuai kebijakan evidence."]
+    },
+    wireshark: {
+      commands: [
+        { title: "Open PCAP", tone: "baseline", description: "Buka hasil capture untuk analisis visual cepat.", command: `wireshark capture-${context.target}.pcap` },
+        { title: "Live Interface", tone: "advanced", description: "Gunakan hanya bila host operator memang diizinkan live capture.", command: `wireshark` }
+      ],
+      notes: ["Lebih aman menganalisis PCAP hasil tcpdump dibanding langsung live capture."]
+    },
+    ngrok: {
+      commands: [
+        { title: "Expose Local Web Port", tone: "baseline", description: "Pakai saat perlu share service lokal untuk validasi terkontrol.", command: `ngrok http 8080` },
+        { title: "Expose TCP Service", tone: "advanced", description: "Gunakan untuk service non-HTTP bila workflow memang membutuhkannya.", command: `ngrok tcp 22` }
+      ],
+      notes: ["Pastikan exposure ini memang sesuai policy lab.", "Catat URL tunnel ke assessment notes."]
+    },
+    jq: {
+      commands: [
+        { title: "Pretty Print JSON", tone: "baseline", description: "Sederhanakan inspeksi output JSON dari tool lain.", command: `cat evidence.json | jq` },
+        { title: "Extract Key Fields", tone: "safe", description: "Ambil field penting untuk ringkasan cepat.", command: `cat evidence.json | jq '.findings[] | {title, severity}'` }
+      ],
+      notes: ["Sangat berguna untuk post-processing evidence parser."]
+    },
+    yara: {
+      commands: [
+        { title: "Scan File Set", tone: "baseline", description: "Cocok untuk validasi artefak atau sample yang sudah terkumpul.", command: `yara rules.yar sample.bin` },
+        { title: "Recursive Folder Scan", tone: "advanced", description: "Gunakan pada koleksi file yang memang sudah di-scope.", command: `yara -r rules.yar ./samples` }
+      ],
+      notes: ["Pastikan rule source tepercaya.", "Simpan hit dan sample secara terpisah."]
+    }
+  };
+  const defaultReference = fallbackToolReference(label, status, category);
+  return {
+    ...defaultReference,
+    ...(explicit[tool] || {})
+  };
+}
+
+function activeToolEntry() {
+  const toolMap = state.toolsStatus?.tools || {};
+  const rows = Array.isArray(state.toolingCatalog) && state.toolingCatalog.length
+    ? state.toolingCatalog.map((entry) => ({ label: entry.label, status: entry.status || toolMap[entry.label] || {} }))
+    : Object.entries(toolMap).map(([label, status]) => ({ label, status }));
+  return rows.find((entry) => entry.label === state.selectedToolLabel) || null;
+}
+
+function closeToolInspectModal() {
+  const modal = $("#toolInspectModal");
+  if (!modal) return;
+  modal.classList.add("hidden");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+function openImportParserModal() {
+  const modal = $("#importParserModal");
+  if (!modal) return;
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+}
+
+function closeImportParserModal() {
+  const modal = $("#importParserModal");
+  if (!modal) return;
+  modal.classList.add("hidden");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+function clearImportParserModal() {
+  const content = $("#importContentInput");
+  if (content) content.value = "";
+  state.importResult = null;
+  renderImportResult();
+}
+
+async function copyToolCommand(button) {
+  const card = button.closest("[data-tool-command-card]");
+  const input = card?.querySelector("[data-tool-command-input]");
+  if (!input) return;
+  await navigator.clipboard.writeText(input.value || "");
+  button.textContent = "Copied";
+  window.setTimeout(() => {
+    button.textContent = "Copy";
+  }, 1200);
+}
+
+async function executeToolCommandCard(button) {
+  const card = button.closest("[data-tool-command-card]");
+  const input = card?.querySelector("[data-tool-command-input]");
+  const output = card?.querySelector("[data-tool-command-output]");
+  const status = card?.querySelector("[data-tool-command-status]");
+  const sudoField = card?.querySelector("[data-tool-sudo-field]");
+  const sudoInput = card?.querySelector("[data-tool-sudo-password]");
+  const toolName = card?.dataset.toolLabel || state.selectedToolLabel || "";
+  if (!card || !input || !output || !status || !toolName) return;
+
+  const command = String(input.value || "").trim();
+  if (!command) {
+    status.textContent = "Command kosong.";
+    status.className = "tool-command-status error";
+    output.classList.remove("hidden");
+    output.textContent = "Isi command dulu sebelum dieksekusi.";
+    return;
+  }
+
+  button.disabled = true;
+  status.textContent = "Running...";
+  status.className = "tool-command-status running";
+  output.classList.remove("hidden");
+  output.textContent = "Menjalankan command...";
+
+  try {
+    const result = await api("/api/tools/execute", {
+      method: "POST",
+      body: JSON.stringify({
+        tool_name: toolName,
+        command,
+        sudo_password: sudoInput?.value || "",
+        timeout: 180
+      })
+    });
+    status.textContent = result.success
+      ? (result.cached ? "Success (cached)" : "Success")
+      : `Failed (${result.returncode})`;
+    status.className = `tool-command-status ${result.success ? "success" : "error"}`;
+    sudoField?.classList.toggle("hidden", !result.requires_sudo_password);
+    const stdout = String(result.stdout || "").trim();
+    const stderr = String(result.stderr || "").trim();
+    output.textContent = [
+      `$ ${result.command}`,
+      stdout ? `\nSTDOUT\n${stdout}` : "",
+      stderr ? `\nSTDERR\n${stderr}` : "",
+      !stdout && !stderr ? "\nTidak ada output." : ""
+    ].join("\n").trim();
+  } catch (error) {
+    status.textContent = "Failed";
+    status.className = "tool-command-status error";
+    output.textContent = error.message || "Eksekusi command gagal.";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function copyModuleCommand(button) {
+  const card = button.closest("[data-module-command-card]");
+  const command = card?.querySelector(".module-command")?.textContent || "";
+  if (!command) return;
+  await navigator.clipboard.writeText(command);
+  button.textContent = "Copied";
+  window.setTimeout(() => {
+    button.textContent = "Copy";
+  }, 1200);
+}
+
+async function executeModuleCommandCard(button) {
+  const card = button.closest("[data-module-command-card]");
+  const output = card?.querySelector("[data-module-command-output]");
+  const status = card?.querySelector("[data-module-command-status]");
+  const sudoField = card?.querySelector("[data-tool-sudo-field]");
+  const sudoInput = card?.querySelector("[data-tool-sudo-password]");
+  const toolName = card?.dataset.toolLabel || "";
+  const command = String(card?.querySelector(".module-command")?.textContent || "").trim();
+  if (!card || !output || !status || !toolName) return;
+
+  if (!command) {
+    status.textContent = "Command kosong.";
+    status.className = "tool-command-status error";
+    output.classList.remove("hidden");
+    output.textContent = "Tidak ada command yang bisa dieksekusi.";
+    return;
+  }
+
+  button.disabled = true;
+  status.textContent = "Running...";
+  status.className = "tool-command-status running";
+  output.classList.remove("hidden");
+  output.textContent = "Menjalankan command...";
+
+  try {
+    const result = await api("/api/tools/execute", {
+      method: "POST",
+      body: JSON.stringify({
+        tool_name: toolName,
+        command,
+        sudo_password: sudoInput?.value || "",
+        timeout: 180
+      })
+    });
+    status.textContent = result.success
+      ? (result.cached ? "Success (cached)" : "Success")
+      : `Failed (${result.returncode})`;
+    status.className = `tool-command-status ${result.success ? "success" : "error"}`;
+    sudoField?.classList.toggle("hidden", !result.requires_sudo_password);
+    const stdout = String(result.stdout || "").trim();
+    const stderr = String(result.stderr || "").trim();
+    output.textContent = [
+      `$ ${result.command}`,
+      stdout ? `\nSTDOUT\n${stdout}` : "",
+      stderr ? `\nSTDERR\n${stderr}` : "",
+      !stdout && !stderr ? "\nTidak ada output." : ""
+    ].join("\n").trim();
+  } catch (error) {
+    status.textContent = "Failed";
+    status.className = "tool-command-status error";
+    output.textContent = error.message || "Eksekusi command gagal.";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function interactiveConsolePayload(toolName, command, sudoInput = null) {
+  return {
+    tool_name: toolName,
+    command,
+    sudo_password: sudoInput?.value || ""
+  };
+}
+
+function interactiveToolHints(toolName = "") {
+  const normalized = String(toolName || "").trim().toLowerCase();
+  return INTERACTIVE_COMMAND_HINTS[normalized] || ["help", "exit", "quit"];
+}
+
+function resetInteractiveTabState() {
+  state.interactiveTabState = null;
+}
+
+function updateInteractiveHintLabel(message = "") {
+  const hint = $("#interactiveHintLabel");
+  if (!hint) return;
+  hint.textContent = message || "Tab untuk auto-complete command umum. Enter untuk kirim.";
+}
+
+function applyInteractiveTabCompletion(input) {
+  const session = state.activeInteractiveSession;
+  if (!session || !input) return false;
+  const value = String(input.value || "");
+  const cursor = input.selectionStart ?? value.length;
+  const beforeCursor = value.slice(0, cursor);
+  const afterCursor = value.slice(cursor);
+  const tokenMatch = beforeCursor.match(/(?:^|\s)([^\s]*)$/);
+  const currentToken = tokenMatch ? tokenMatch[1] : "";
+  const tokenStart = tokenMatch ? cursor - currentToken.length : cursor;
+  const trimmed = beforeCursor.trimStart();
+  const hints = interactiveToolHints(session.tool_name);
+
+  let candidates = [];
+  if (!trimmed || (trimmed === currentToken && !beforeCursor.includes(" "))) {
+    candidates = hints.filter((entry) => entry.startsWith(currentToken));
+  } else if (!currentToken) {
+    candidates = hints;
+  } else {
+    candidates = hints.filter((entry) => entry.startsWith(currentToken));
+  }
+  if (!candidates.length) {
+    updateInteractiveHintLabel("Tidak ada saran command yang cocok.");
+    resetInteractiveTabState();
+    return false;
+  }
+
+  const tabKey = `${session.tool_name}:${currentToken}:${candidates.join("|")}`;
+  let index = 0;
+  if (state.interactiveTabState?.key === tabKey) {
+    index = (state.interactiveTabState.index + 1) % candidates.length;
+  }
+  const suggestion = candidates[index];
+  const replacement = suggestion;
+  input.value = `${value.slice(0, tokenStart)}${replacement}${afterCursor}`;
+  const nextCursor = tokenStart + replacement.length;
+  input.selectionStart = nextCursor;
+  input.selectionEnd = nextCursor;
+  state.interactiveTabState = { key: tabKey, index };
+  updateInteractiveHintLabel(
+    candidates.length > 1
+      ? `Saran ${index + 1}/${candidates.length}: ${suggestion}`
+      : `Auto-complete: ${suggestion}`
+  );
+  return true;
+}
+
+function isPlainEnterKey(event) {
+  const key = String(event?.key || "");
+  const code = String(event?.code || "");
+  const keyCode = Number(event?.keyCode || 0);
+  const which = Number(event?.which || 0);
+  return (
+    !event?.shiftKey &&
+    !event?.ctrlKey &&
+    !event?.metaKey &&
+    !event?.altKey &&
+    !event?.isComposing &&
+    (key === "Enter" || code === "Enter" || code === "NumpadEnter" || keyCode === 13 || which === 13)
+  );
+}
+
+function renderInteractiveConsoleSession(session) {
+  const output = $("#consoleOutput");
+  const activeLabel = $("#activeJobLabel");
+  const commandLabel = $("#activeCommandLabel");
+  const toolbarLabel = $("#terminalToolbarLabel");
+  const promptLabel = $("#interactivePromptLabel");
+  const inputRow = $("#interactiveConsoleControls");
+  const input = $("#interactiveConsoleInput");
+  const sendButton = $("#sendInteractiveConsoleBtn");
+  const closeButton = $("#closeInteractiveConsoleBtn");
+  if (!output || !activeLabel || !commandLabel || !inputRow) return;
+
+  if (!session) {
+    inputRow.classList.add("hidden");
+    if (input) input.value = "";
+    if (sendButton) sendButton.disabled = true;
+    if (closeButton) closeButton.disabled = true;
+    if (toolbarLabel) toolbarLabel.textContent = "console@redteam: ready";
+    if (promptLabel) promptLabel.textContent = "$";
+    updateInteractiveHintLabel();
+    return;
+  }
+
+  activeLabel.textContent = `${session.tool_name} interactive session`;
+  commandLabel.textContent = session.status === "running"
+    ? (session.started_command || session.command || "Interactive command")
+    : `${session.tool_name} session stopped`;
+  if (toolbarLabel) {
+    toolbarLabel.textContent = `${session.tool_name}@redteam: ${session.status}`;
+  }
+  if (promptLabel) {
+    promptLabel.textContent = session.tool_name === "metasploit" ? "msf6 >" : `${session.tool_name} $`;
+  }
+  output.textContent = session.output || "Menunggu output interactive session...";
+  output.scrollTop = output.scrollHeight;
+  inputRow.classList.remove("hidden");
+  if (sendButton) sendButton.disabled = session.status !== "running";
+  if (closeButton) closeButton.disabled = false;
+  updateInteractiveHintLabel();
+  setConsoleStatus(session.status === "running" ? "running" : "idle", session.status);
+}
+
+async function setTerminalFullscreen(force = null) {
+  const panel = document.querySelector('.insight-panel[data-insight-panel="console"]');
+  const button = $("#toggleTerminalFullscreenBtn");
+  if (!panel || !button) return;
+  const isNativeFullscreen = document.fullscreenElement === panel;
+  const isFallbackFullscreen = panel.classList.contains("console-fullscreen");
+  const currentEnabled = isNativeFullscreen || isFallbackFullscreen;
+  const shouldEnable = force === null ? !currentEnabled : Boolean(force);
+
+  try {
+    if (shouldEnable && document.fullscreenElement !== panel && panel.requestFullscreen) {
+      await panel.requestFullscreen();
+    } else if (!shouldEnable && document.fullscreenElement === panel && document.exitFullscreen) {
+      await document.exitFullscreen();
+    }
+  } catch (error) {
+    // Fallback handled below.
+  }
+
+  const nativeActive = document.fullscreenElement === panel;
+  const fallbackActive = shouldEnable && !nativeActive;
+  panel.classList.toggle("console-fullscreen", fallbackActive || nativeActive);
+  button.textContent = shouldEnable ? "Exit Full Screen" : "Full Screen";
+  button.setAttribute("aria-pressed", shouldEnable ? "true" : "false");
+  document.body.classList.toggle("terminal-fullscreen-open", shouldEnable);
+}
+
+async function pollInteractiveConsoleSession() {
+  if (!state.activeInteractiveSession?.id) return;
+  try {
+    const result = await api(`/api/tools/interactive/${encodeURIComponent(state.activeInteractiveSession.id)}`);
+    state.activeInteractiveSession = result.session || null;
+    renderInteractiveConsoleSession(state.activeInteractiveSession);
+    if (state.activeInteractiveSession?.status === "running") {
+      window.clearTimeout(state.interactivePollTimer);
+      state.interactivePollTimer = window.setTimeout(pollInteractiveConsoleSession, 900);
+    }
+  } catch (error) {
+    window.clearTimeout(state.interactivePollTimer);
+    state.activeInteractiveSession = null;
+    renderInteractiveConsoleSession(null);
+    if (state.activeJob) {
+      renderConsole(state.activeJob);
+    }
+    showToast(error.message || "Interactive session terputus.");
+  }
+}
+
+async function openInteractiveConsoleSession(toolName, command, sudoInput = null) {
+  const result = await api("/api/tools/interactive/open", {
+    method: "POST",
+    body: JSON.stringify(interactiveConsolePayload(toolName, command, sudoInput))
+  });
+  state.activeInteractiveSession = result.session || null;
+  state.insightTab = "console";
+  renderInsightTabs();
+  renderInteractiveConsoleSession(state.activeInteractiveSession);
+  window.clearTimeout(state.interactivePollTimer);
+  if (state.activeInteractiveSession?.status === "running") {
+    state.interactivePollTimer = window.setTimeout(pollInteractiveConsoleSession, 900);
+  }
+  showToast(`${toolName} live console dibuka.`);
+}
+
+async function sendInteractiveConsoleInput() {
+  const sessionId = state.activeInteractiveSession?.id;
+  const input = $("#interactiveConsoleInput");
+  if (!sessionId || !input) return;
+  const command = String(input.value || "").trim();
+  if (!command) return;
+  const result = await api(`/api/tools/interactive/${encodeURIComponent(sessionId)}/input`, {
+    method: "POST",
+    body: JSON.stringify({ command })
+  });
+  state.activeInteractiveSession = result.session || null;
+  input.value = "";
+  resetInteractiveTabState();
+  renderInteractiveConsoleSession(state.activeInteractiveSession);
+  if (state.activeInteractiveSession?.status === "running") {
+    window.clearTimeout(state.interactivePollTimer);
+    state.interactivePollTimer = window.setTimeout(pollInteractiveConsoleSession, 900);
+  }
+}
+
+async function closeInteractiveConsoleSession() {
+  const sessionId = state.activeInteractiveSession?.id;
+  window.clearTimeout(state.interactivePollTimer);
+  if (!sessionId) {
+    state.activeInteractiveSession = null;
+    renderInteractiveConsoleSession(null);
+    if (state.activeJob) renderConsole(state.activeJob);
+    return;
+  }
+  try {
+    await api(`/api/tools/interactive/${encodeURIComponent(sessionId)}/close`, { method: "POST" });
+  } catch (error) {
+    showToast(error.message || "Gagal menutup interactive session.");
+  }
+  state.activeInteractiveSession = null;
+  renderInteractiveConsoleSession(null);
+  if (state.activeJob) renderConsole(state.activeJob);
+  else renderConsole(null);
+}
+
+async function openToolCommandInLiveConsole(button) {
+  const card = button.closest("[data-tool-command-card]");
+  const input = card?.querySelector("[data-tool-command-input]");
+  const sudoInput = card?.querySelector("[data-tool-sudo-password]");
+  const toolName = card?.dataset.toolLabel || state.selectedToolLabel || "";
+  if (!card || !input || !toolName) return;
+  const command = String(input.value || "").trim();
+  if (!command) {
+    showToast("Command kosong.");
+    return;
+  }
+  await openInteractiveConsoleSession(toolName, command, sudoInput);
+}
+
+async function openModuleCommandInLiveConsole(button) {
+  const card = button.closest("[data-module-command-card]");
+  const sudoInput = card?.querySelector("[data-tool-sudo-password]");
+  const toolName = card?.dataset.toolLabel || "";
+  const command = String(card?.querySelector(".module-command")?.textContent || "").trim();
+  if (!card || !toolName || !command) return;
+  await openInteractiveConsoleSession(toolName, command, sudoInput);
+}
+
+function openToolInspectModal(label, status) {
+  const modal = $("#toolInspectModal");
+  const title = $("#toolInspectTitle");
+  const badge = $("#toolInspectBadge");
+  const meta = $("#toolInspectMeta");
+  const purpose = $("#toolInspectPurpose");
+  const commands = $("#toolInspectCommands");
+  const usage = $("#toolInspectUsage");
+  const notes = $("#toolInspectNotes");
+  const modules = $("#toolInspectModules");
+  if (!modal || !title || !badge || !meta || !purpose || !commands || !usage || !notes || !modules) return;
+
+  if (!label) {
+    closeToolInspectModal();
+    return;
+  }
+
+  const category = toolCategoryForLabel(label);
+  const severityKey = status?.installed === true ? "low" : status?.kind === "conceptual" ? "info" : "high";
+  const usageModules = toolUsageModules(label);
+  const reference = toolReferenceData(label, status);
+
+  title.textContent = label;
+  badge.textContent = status?.installed === true ? "installed" : status?.kind || "missing";
+  badge.className = `severity-pill severity-${severityKey}`;
+  meta.innerHTML = `
+    <span class="module-chip module-chip-soft">${category}</span>
+    ${status?.command ? `<span class="module-chip module-chip-muted">${status.command}</span>` : ""}
+    ${status?.kind ? `<span class="module-chip module-chip-soft">${status.kind}</span>` : ""}
+    <span class="module-chip module-chip-soft">risk ${selectedRiskMode()}</span>
+    <span class="module-chip module-chip-muted">used in ${usageModules.length} modules</span>
+  `;
+  purpose.textContent = toolPurposeCopy(category);
+  commands.innerHTML = (reference.commands || []).map((item, index) => `
+    <article class="tool-command-card" data-tool-command-card="${index}" data-tool-label="${escapeHtml(label)}">
+      <header>
+        <strong>${item.title}</strong>
+        <span class="severity-pill severity-${item.tone === "advanced" ? "high" : item.tone === "safe" ? "low" : "info"}">${item.tone}</span>
+      </header>
+      <p>${item.description}</p>
+      <textarea class="tool-command-editor" data-tool-command-input spellcheck="false">${escapeHtml(normalizeCommandForTarget(item.command, currentTargetValue()))}</textarea>
+      ${toolCommandSudoFieldMarkup(normalizeCommandForTarget(item.command, currentTargetValue()))}
+      <div class="tool-command-actions">
+        <button class="ghost-button compact" type="button" data-copy-tool-command>Copy</button>
+        ${isInteractiveToolLabel(label)
+          ? `<button class="primary-button compact" type="button" data-open-tool-console>Open Live Console</button>`
+          : `<button class="primary-button compact" type="button" data-run-tool-command>Execute</button>`}
+        <span class="tool-command-status" data-tool-command-status>Ready</span>
+      </div>
+      <pre class="tool-command-output hidden" data-tool-command-output>Belum ada output.</pre>
+    </article>
+  `).join("");
+  usage.textContent = reference.usage;
+  notes.innerHTML = (reference.notes || []).map((item) => `<span class="tool-note-chip">${item}</span>`).join("");
+  modules.innerHTML = usageModules.length
+    ? usageModules.map((module) => `
+      <button class="module-chip module-chip-soft" type="button" data-jump-module="${module.id}">${module.phase} - ${module.title}</button>
+    `).join("")
+    : '<span class="module-chip module-chip-muted">Belum terhubung ke modul katalog</span>';
+
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+}
+
+function renderToolingHealth() {
+  const summaryContainer = $("#toolSummaryGrid");
+  const listContainer = $("#toolHealthList");
+  const catalogLabel = $("#toolCatalogLabel");
+  if (!summaryContainer) return;
+  const summary = state.toolsStatus?.summary || {};
+  const toolMap = state.toolsStatus?.tools || {};
+  const rows = Array.isArray(state.toolingCatalog) && state.toolingCatalog.length
+    ? state.toolingCatalog.map((entry) => [entry.label, entry.status || toolMap[entry.label] || {}])
+    : Object.entries(toolMap);
+
+  summaryContainer.innerHTML = `
+    <div class="tool-summary-card">
+      <span>Total Tools</span>
+      <strong>${summary.total || rows.length || 0}</strong>
+      <small>Terdaftar di backend</small>
+    </div>
+    <div class="tool-summary-card">
+      <span>Available</span>
+      <strong>${summary.available || 0}</strong>
+      <small>Terdeteksi di environment</small>
+    </div>
+    <div class="tool-summary-card">
+      <span>Conceptual</span>
+      <strong>${summary.conceptual || 0}</strong>
+      <small>Masih konseptual atau wrapper</small>
+    </div>
+  `;
+
+  if (!listContainer) {
+    return;
+  }
+
+  if (!rows.length) {
+    listContainer.innerHTML = '<p class="empty-jobs">Belum ada data tooling.</p>';
+    return;
+  }
+
+  const filtered = filteredToolCatalogEntries();
+
+  if (catalogLabel) {
+    catalogLabel.textContent = `Tool Catalog (${filtered.length}/${rows.length})`;
+  }
+
+  document.querySelectorAll("[data-tool-filter]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.toolFilter === state.toolStatusFilter);
+  });
+
+  if (!filtered.some((entry) => entry.label === state.selectedToolLabel)) {
+    state.selectedToolLabel = filtered[0]?.label || "";
+  }
+
+  const grouped = filtered.reduce((accumulator, entry) => {
+    if (!accumulator[entry.category]) accumulator[entry.category] = [];
+    accumulator[entry.category].push(entry);
+    return accumulator;
+  }, {});
+
+  const categoryOrder = ["Discovery", "DNS & Surface", "Web Assessment", "Validation", "Credential", "Post Exploitation", "Detection & Forensics", "Utility", "Other"];
+  const sections = categoryOrder
+    .filter((category) => Array.isArray(grouped[category]) && grouped[category].length);
+
+  if (!sections.length) {
+    listContainer.innerHTML = '<p class="empty-jobs">Tidak ada tool yang cocok dengan filter saat ini.</p>';
+    return;
+  }
+
+  listContainer.innerHTML = sections.map((category) => `
+    <section class="tool-category-group">
+      <div class="tool-category-head">
+        <strong>${category}</strong>
+        <span class="severity-pill severity-info">${grouped[category].length} tools</span>
+      </div>
+      <div class="tool-grid">
+        ${grouped[category].map(({ label, status }) => `
+          <article class="tool-item${label === state.selectedToolLabel ? " is-active" : ""}">
+            <div class="tool-item-head">
+              <strong>${label}</strong>
+              <span class="severity-pill severity-${status?.installed ? "low" : status?.kind === "conceptual" ? "info" : "high"}">${status?.installed ? "installed" : status?.kind || "missing"}</span>
+            </div>
+            <div class="tool-item-meta">
+              ${status?.command ? `<span class="module-chip module-chip-soft">${status.command}</span>` : ""}
+              <span class="module-chip module-chip-muted">${category}</span>
+              <span class="module-chip module-chip-soft">used in ${toolUsageModules(label).length} modules</span>
+            </div>
+            <div class="assessment-actions-row">
+              <button class="ghost-button compact" type="button" data-select-tool="${label}">Inspect</button>
+              <button class="ghost-button compact" type="button" data-check-tool="${label}">Check</button>
+            </div>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+  `).join("");
+
+  const selectedEntry = filtered.find((entry) => entry.label === state.selectedToolLabel) || filtered[0];
+  state.selectedToolLabel = selectedEntry?.label || "";
+}
+
+function renderAssessmentLibrary() {
+  const container = $("#assessmentList");
+  if (!container) return;
+  if (!state.assessments.length) {
+    container.innerHTML = '<p class="empty-jobs">Belum ada assessment tersimpan.</p>';
+    return;
+  }
+  container.innerHTML = state.assessments.map((assessment) => `
+    <article class="assessment-item${assessment.id === state.activeAssessmentId ? " is-active" : ""}">
+      <div class="assessment-item-head">
+        <strong>${assessment.target}</strong>
+        <span class="severity-pill severity-info">${assessment.risk_mode || "safe"}</span>
+      </div>
+      <div class="assessment-item-meta">
+        <span class="module-chip module-chip-soft">${assessment.target_kind || "ip"}</span>
+        <span class="module-chip module-chip-muted">${assessment.operator_name || "operator"}</span>
+        <span class="module-chip module-chip-soft">${assessment.finding_count || 0} findings</span>
+      </div>
+      <small>${assessment.id} - ${formatDateLabel(assessment.updated_at || assessment.created_at)}</small>
+      <div class="assessment-actions-row">
+        <button class="ghost-button compact" type="button" data-select-assessment="${assessment.id}">Open</button>
+      </div>
+    </article>
+  `).join("");
+}
+
+function renderWorkspaceBrowser() {
+  const sectionsContainer = $("#workspaceSections");
+  const pathLabel = $("#workspacePathLabel");
+  const refreshButton = $("#refreshWorkspaceBtn");
+  const previewTitle = $("#workspacePreviewTitle");
+  const previewMeta = $("#workspacePreviewMeta");
+  const previewContent = $("#workspacePreviewContent");
+  if (!sectionsContainer || !pathLabel || !previewTitle || !previewMeta || !previewContent) return;
+
+  refreshButton.disabled = !state.activeAssessmentId;
+
+  if (!state.activeWorkspace?.workspace) {
+    pathLabel.textContent = "Workspace belum dipilih";
+    sectionsContainer.innerHTML = "Belum ada assessment aktif atau workspace belum tersedia.";
+    previewTitle.textContent = "Preview file";
+    previewMeta.textContent = "Belum ada file dipilih";
+    previewContent.textContent = "Workspace assessment aktif akan tampil di sini bersama file report, parsed JSON, dan log.";
+    return;
+  }
+
+  pathLabel.textContent = state.activeWorkspace.workspace;
+  const sections = Array.isArray(state.activeWorkspace.sections) ? state.activeWorkspace.sections : [];
+  sectionsContainer.innerHTML = sections.map((section) => `
+    <article class="asset-item">
+      <div class="asset-item-head">
+        <strong>${section.name}</strong>
+        <span class="severity-pill severity-info">${(section.entries || []).length} files</span>
+      </div>
+      <div class="assessment-actions-row">
+        ${(section.entries || []).map((entry) => `
+          <button class="ghost-button compact" type="button" data-workspace-file="${entry.path}">${entry.name}</button>
+        `).join("")}
+      </div>
+    </article>
+  `).join("");
+
+  if (!state.workspacePreviewPath) {
+    previewTitle.textContent = "Preview file";
+    previewMeta.textContent = "Belum ada file dipilih";
+    previewContent.textContent = "Pilih file report, parsed JSON, atau log dari workspace assessment.";
+  }
+}
+
+function renderTargetAsset() {
+  const container = $("#targetAssetCard");
+  if (!container) return;
+  const asset = state.targetAsset;
+  if (!asset) {
+    container.textContent = "Belum ada asset match untuk target aktif.";
+    return;
+  }
+  container.innerHTML = `
+    <div class="asset-item-head">
+      <strong>${asset.application}</strong>
+      <span class="severity-pill severity-${severityClass(asset.criticality)}">${asset.criticality}</span>
+    </div>
+    <div class="asset-item-meta">
+      <span class="module-chip module-chip-soft">${asset.ip}</span>
+      <span class="module-chip module-chip-muted">${asset.hostname}</span>
+      <span class="module-chip module-chip-soft">${asset.monitoring}</span>
+    </div>
+    <small>${asset.owner_unit} - ${asset.owner_name} - ${asset.environment}</small>
+    <p>${asset.note}</p>
+  `;
+}
+
+function renderReferenceData() {
+  renderTargetAsset();
+}
+
+function renderImportResult() {
+  const container = $("#importResult");
+  if (!container) return;
+  if (!state.importResult) {
+    container.textContent = "Belum ada output yang diparse.";
+    return;
+  }
+  const findings = Array.isArray(state.importResult.findings) ? state.importResult.findings : [];
+  container.textContent = [
+    `Tool        : ${state.importResult.tool_name}`,
+    `Target      : ${state.importResult.target}`,
+    `Line Count  : ${state.importResult.line_count}`,
+    "",
+    "Summary:",
+    ...(state.importResult.summary || []).map((item) => `- ${item}`),
+    "",
+    "Findings:",
+    ...(findings.length ? findings.map((item) => `- [${item.severity}] ${item.title}: ${item.detail}`) : ["- Tidak ada finding terstruktur."])
+  ].join("\n");
+}
+
+function renderDestructiveActions() {
+  const modeLabel = $("#destructiveModeLabel");
+  const note = $("#destructiveNote");
+  const container = $("#destructiveActionsList");
+  const result = $("#destructiveResult");
+  if (!modeLabel || !note || !container || !result) return;
+  const enabled = state.config?.destructive_mode === "enabled";
+  modeLabel.textContent = enabled ? "Policy enabled di backend." : "Policy disabled di backend.";
+  note.textContent = enabled
+    ? "Action destructive hanya boleh dijalankan pada assessment intrusive dengan approval tersimpan."
+    : "Destructive mode masih dimatikan di backend. Panel ini tetap menampilkan registry action untuk review.";
+  container.innerHTML = (state.destructiveActions || []).map((action) => `
+    <article class="destructive-item">
+      <div class="destructive-item-head">
+        <strong>${action.description}</strong>
+        <span class="severity-pill severity-${severityClass(action.severity)}">${action.severity}</span>
+      </div>
+      <small>${action.id}</small>
+      <div class="destructive-actions-row">
+        <button class="ghost-button compact" type="button" data-approve-destructive="${action.id}" ${state.activeAssessmentId ? "" : "disabled"}>Approve</button>
+        <button class="primary-button compact" type="button" data-execute-destructive="${action.id}" ${enabled && state.activeAssessmentId ? "" : "disabled"}>Execute</button>
+      </div>
+    </article>
+  `).join("") || '<p class="empty-jobs">Belum ada destructive action registry.</p>';
+  result.textContent = state.destructiveResult || "Belum ada destructive action dijalankan.";
+}
+
+function renderAssessmentExportButtons() {
+  const hasAssessment = Boolean(state.activeAssessmentId);
+  const workspaceButton = $("#refreshWorkspaceBtn");
+  const evidenceButton = $("#viewAssessmentEvidenceBtn");
+  const markdownButton = $("#viewAssessmentMarkdownBtn");
+  const htmlButton = $("#viewAssessmentHtmlBtn");
+  if (workspaceButton) workspaceButton.disabled = !hasAssessment;
+  if (evidenceButton) evidenceButton.disabled = !hasAssessment;
+  if (markdownButton) markdownButton.disabled = !hasAssessment;
+  if (htmlButton) htmlButton.disabled = !hasAssessment;
 }
 
 function persistLastTarget(value) {
@@ -281,9 +2039,116 @@ function commandPreviewMarkup(commands = []) {
   `;
 }
 
+function inferToolNameFromCommand(command, module = null) {
+  const literal = String(command || "").trim();
+  const parts = literal.split(/\s+/).filter(Boolean);
+  const token = parts[0]?.trim().toLowerCase() || "";
+  const effectiveToken = token === "sudo" ? (parts[1] || "").trim().toLowerCase() : token;
+  if (effectiveToken) return effectiveToken;
+  const tooling = Array.isArray(module?.tooling_details) ? module.tooling_details : [];
+  const binary = tooling.find((item) => item?.kind === "binary" && item?.label);
+  if (binary?.label) return String(binary.label).toLowerCase();
+  const first = Array.isArray(module?.tooling) ? module.tooling.find(Boolean) : "";
+  return String(first || "").toLowerCase();
+}
+
+function commandNeedsSudoField(command) {
+  return String(command || "").trim().toLowerCase().startsWith("sudo ");
+}
+
+function toolCommandSudoFieldMarkup(command = "") {
+  return `
+    <label class="tool-command-secret hidden" data-tool-sudo-field>
+      <span>Sudo password</span>
+      <input type="password" autocomplete="current-password" placeholder="Masukkan password sudo bila diperlukan" data-tool-sudo-password>
+    </label>
+  `;
+}
+
+function isModuleCommandsExpanded(moduleId) {
+  return state.expandedModuleCommandIds.includes(moduleId);
+}
+
+function setModuleCommandsExpanded(moduleId, expanded = true) {
+  const next = new Set(state.expandedModuleCommandIds);
+  if (expanded) next.add(moduleId);
+  else next.delete(moduleId);
+  state.expandedModuleCommandIds = [...next];
+}
+
+function commandActionMarkup(module, commands = []) {
+  const target = currentTargetValue();
+  const resolved = (commands || [])
+    .map((command) => String(command || "").replaceAll("TARGET", target))
+    .filter(Boolean);
+  if (!resolved.length) {
+    return `<div class="module-command-list"><code class="module-command">No command preview</code></div>`;
+  }
+  return `
+    <div class="module-command-list">
+      ${resolved.map((command, index) => `
+        <article class="module-command-card" data-module-command-card="${module.id}-${index}" data-tool-label="${escapeHtml(inferToolNameFromCommand(command, module))}">
+          <code class="module-command">${escapeHtml(command)}</code>
+          ${toolCommandSudoFieldMarkup(command)}
+          <div class="module-command-actions">
+            <button class="ghost-button compact" type="button" data-copy-module-command>Copy</button>
+            ${isInteractiveToolLabel(inferToolNameFromCommand(command, module))
+              ? `<button class="primary-button compact" type="button" data-open-module-console>Open Live Console</button>`
+              : `<button class="primary-button compact" type="button" data-run-module-command>Run</button>`}
+            <span class="tool-command-status" data-module-command-status>Ready</span>
+          </div>
+          <pre class="tool-command-output hidden" data-module-command-output>Belum ada output.</pre>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function commandPreviewBlockMarkup(module) {
+  if (isModuleCommandsExpanded(module.id)) {
+    const commands = commandPreviewForModule(module);
+    if (!commands.length) {
+      return `
+        <div class="module-command-collapsed" data-module-command-collapsed="${module.id}">
+          <code class="module-command">Memuat command preview...</code>
+        </div>
+      `;
+    }
+    return commandActionMarkup(module, commands);
+  }
+  return `
+    <div class="module-command-collapsed" data-module-command-collapsed="${module.id}">
+      <code class="module-command">Command preview dimuat saat dibuka.</code>
+      <div class="module-command-actions">
+        <button class="ghost-button compact" type="button" data-expand-module-commands="${module.id}">
+          Buka Command
+        </button>
+      </div>
+    </div>
+  `;
+}
+
 function commandPreviewForModule(module) {
-  const byProfile = module?.command_preview_by_profile || {};
+  const byProfile = module?.command_preview_by_profile || state.moduleDryRunCache?.[module?.id]?.command_preview_by_profile || {};
   return byProfile[selectedModuleProfile()] || byProfile.balanced || [];
+}
+
+async function fetchModuleDryRunData(moduleId) {
+  if (state.moduleDryRunCache[moduleId]) {
+    return state.moduleDryRunCache[moduleId];
+  }
+  const payload = readTargetPayload();
+  const result = await api(`/api/modules/${moduleId}/dry-run?target=${encodeURIComponent(payload.target)}&note=${encodeURIComponent(payload.note)}&execution_profile=${encodeURIComponent(payload.execution_profile)}`);
+  const cached = {
+    target: payload.target,
+    execution_profile: payload.execution_profile,
+    command_preview_by_profile: {
+      [payload.execution_profile]: Array.isArray(result?.dry_run?.commands) ? result.dry_run.commands : []
+    },
+    dry_run: result.dry_run || null
+  };
+  state.moduleDryRunCache[moduleId] = cached;
+  return cached;
 }
 
 function executionFlowMarkup(lines = []) {
@@ -381,10 +2246,9 @@ function animatePhaseSwap() {
 }
 
 function setViewMode(mode) {
-  state.viewMode = mode === "detail" ? "detail" : "playbook";
+  state.viewMode = "detail";
   document.body.dataset.viewMode = state.viewMode;
   localStorage.setItem("lab-console-view-mode", state.viewMode);
-  updateViewSwitch();
   updateViewModeNote();
 }
 
@@ -401,76 +2265,133 @@ function jobExecutionProfile(job) {
     || "fast";
 }
 
-function updateViewSwitch() {
-  const playbook = $("#playbookViewBtn");
-  const detail = $("#detailViewBtn");
-  if (!playbook || !detail) return;
-  playbook.classList.toggle("active", state.viewMode === "playbook");
-  detail.classList.toggle("active", state.viewMode === "detail");
-}
-
 function updateViewModeNote() {
   const note = $("#viewModeNote");
   if (!note) return;
-  note.textContent = state.viewMode === "playbook"
-    ? "Ringkas untuk pentester: fokus ke proses eksekusi, toolset, dan output yang diharapkan."
-    : "Mode detail menampilkan deskripsi penuh, command preview, dan konteks modul yang lebih lengkap.";
+  note.textContent = "Mode detail menampilkan deskripsi, command preview, toolset, dan konteks modul yang lengkap.";
 }
 
-function renderPlaybookCard(module) {
-  return `
-    <article class="module-card module-card-playbook">
-        <div class="module-card-head">
-          <div>
-            <h4>${module.title}</h4>
-            <div class="module-subhead">
-              <span class="skill-pill">${module.skill_level}</span>
-              <span class="focus-pill">${module.operator_focus}</span>
-              <span class="stance-pill">${module.simulation_stance}</span>
-            </div>
-          </div>
-        <span class="risk-pill risk-${module.risk}">${module.risk}</span>
-      </div>
-      <div class="module-tags">
-        <span>${selectedModuleProfile()}</span>
-        <span>${module.mitre}</span>
-      </div>
-      <div class="playbook-summary-grid">
-          <div class="playbook-line">
-            <strong>Depth</strong>
-            <div class="module-chip-row">
-              <span class="module-chip module-chip-depth">${module.depth_profile}</span>
-              ${chipMarkup(module.allowed_checks, "module-chip module-chip-muted")}
-            </div>
-          </div>
-          <div class="playbook-line">
-          <strong>Tools</strong>
-          <div class="module-chip-row">${toolingChipMarkup(module, module.tooling, "module-chip")}</div>
-        </div>
-        <div class="playbook-line">
-          <strong>Evidence</strong>
-          <div class="module-chip-row">${chipMarkup(module.evidence, "module-chip module-chip-soft")}</div>
-        </div>
-        <div class="playbook-line">
-          <strong>Detect</strong>
-          <div class="module-chip-row">${chipMarkup(module.telemetry, "module-chip module-chip-muted")}</div>
-        </div>
-        <div class="playbook-line">
-          <strong>Execution Flow</strong>
-          ${executionFlowMarkup(module.preview)}
-        </div>
-      </div>
-      <div class="module-actions">
-        <button class="ghost-button compact" type="button" data-preview="${module.id}">Preview</button>
-        <button class="primary-button compact" type="button" data-run="${module.id}">Run</button>
-      </div>
-    </article>
-  `;
+function setOperationsTab(tab) {
+  const allowed = new Set(["workspace", "health", "advanced"]);
+  state.operationsTab = allowed.has(tab) ? tab : "workspace";
+  localStorage.setItem("lab-console-operations-tab", state.operationsTab);
+  document.querySelectorAll("[data-operations-tab]").forEach((button) => {
+    const isActive = button.dataset.operationsTab === state.operationsTab;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", String(isActive));
+  });
+  document.querySelectorAll("[data-operations-panel]").forEach((panel) => {
+    panel.classList.toggle("hidden", panel.dataset.operationsPanel !== state.operationsTab);
+  });
+  const note = $("#operationsTabNote");
+  if (note) {
+    note.textContent = state.operationsTab === "workspace"
+      ? "Riwayat assessment, export, dan file hasil yang paling sering dipakai operator."
+      : state.operationsTab === "health"
+        ? "Status tool, preset, asset, dan reference untuk validasi lingkungan kerja."
+        : "Parser, findings, approval, dan destructive flow yang lebih sensitif atau jarang dipakai.";
+  }
+  if (state.operationsVisible) {
+    if (state.operationsTab === "workspace") {
+      scheduleDeferredTask(ensureOperatorWorkspaceDataLoaded);
+    } else if (state.operationsTab === "health") {
+      if (state.healthTab === "strategy") {
+        scheduleDeferredTask(ensureToolCatalogDataLoaded);
+      } else {
+        scheduleDeferredTask(ensureReferencePanelDataLoaded);
+      }
+    }
+  }
+}
+
+function setOperationsVisibility(visible) {
+  state.operationsVisible = Boolean(visible);
+  const shell = document.querySelector(".operations-shell");
+  const body = $("#operationsShellBody");
+  const toggle = $("#toggleOperationsBtn");
+  if (shell) shell.classList.toggle("is-collapsed", !state.operationsVisible);
+  if (body) body.classList.toggle("hidden", !state.operationsVisible);
+  if (toggle) {
+    toggle.textContent = state.operationsVisible ? "Sembunyikan Workspace" : "Buka Workspace";
+    toggle.setAttribute("aria-expanded", String(state.operationsVisible));
+  }
+  if (state.operationsVisible) {
+    scheduleDeferredTask(ensureOperatorWorkspaceDataLoaded);
+  }
+}
+
+function setHealthTab(tab) {
+  const allowed = new Set(["strategy", "reference"]);
+  state.healthTab = allowed.has(tab) ? tab : "strategy";
+  localStorage.setItem("lab-console-health-tab", state.healthTab);
+  document.querySelectorAll("[data-health-tab]").forEach((button) => {
+    const isActive = button.dataset.healthTab === state.healthTab;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", String(isActive));
+  });
+  document.querySelectorAll("[data-health-panel]").forEach((panel) => {
+    panel.classList.toggle("hidden", panel.dataset.healthPanel !== state.healthTab);
+  });
+  if (state.operationsVisible && state.operationsTab === "health") {
+    if (state.healthTab === "strategy") {
+      scheduleDeferredTask(ensureToolCatalogDataLoaded);
+    } else if (state.healthTab === "reference") {
+      scheduleDeferredTask(ensureReferencePanelDataLoaded);
+    }
+  }
+}
+
+function openToolCatalogWorkspace() {
+  const nextSurface = state.catalogSurface === "tools" ? "modules" : "tools";
+  setCatalogSurface(nextSurface);
+  if (nextSurface === "tools") {
+    void ensureToolCatalogDataLoaded();
+  }
+}
+
+function setCatalogSurface(surface) {
+  state.catalogSurface = surface === "tools" ? "tools" : "modules";
+  const eyebrow = $("#catalogEyebrow");
+  const title = $("#catalogTitle");
+  const note = $("#viewModeNote");
+  const toggle = $("#openToolCatalogBtn");
+  const search = $("#moduleSearchInput");
+
+  if (eyebrow) eyebrow.textContent = state.catalogSurface === "tools" ? "Tool Catalog" : "Module Catalog";
+  if (title) title.textContent = state.catalogSurface === "tools" ? "Katalog Tools WSL" : "Modul Cyber Kill Chain";
+  if (note) {
+    note.textContent = state.catalogSurface === "tools"
+      ? "Status tool, referensi command, dan kepadatan penggunaan modul ditampilkan langsung di area katalog utama."
+      : "Mode detail menampilkan deskripsi, command preview, toolset, dan konteks modul yang lengkap.";
+  }
+  if (toggle) toggle.textContent = state.catalogSurface === "tools" ? "Module Catalog" : "Tool Catalog";
+  if (search) {
+    search.placeholder = state.catalogSurface === "tools"
+      ? "Cari tool, alias, command, kategori..."
+      : "Cari modul, tool, MITRE, risk...";
+    search.value = state.catalogSurface === "tools" ? state.toolSearchQuery : state.moduleSearchQuery;
+  }
+  renderModules();
+  document.querySelector(".module-pane")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function setAdvancedTab(tab) {
+  const allowed = new Set(["findings"]);
+  state.advancedTab = allowed.has(tab) ? tab : "findings";
+  localStorage.setItem("lab-console-advanced-tab", state.advancedTab);
+  document.querySelectorAll("[data-advanced-tab]").forEach((button) => {
+    const isActive = button.dataset.advancedTab === state.advancedTab;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", String(isActive));
+  });
+  document.querySelectorAll("[data-advanced-panel]").forEach((panel) => {
+    panel.classList.toggle("hidden", panel.dataset.advancedPanel !== state.advancedTab);
+  });
 }
 
 function renderDetailCard(module) {
   return `
-    <article class="module-card">
+    <article class="module-card${module.id === state.highlightedModuleId ? " is-highlighted" : ""}" data-module-card="${module.id}">
       <div class="module-card-head">
         <div>
           <h4>${module.title}</h4>
@@ -509,11 +2430,10 @@ function renderDetailCard(module) {
       </div>
       <div class="module-detail-block">
         <strong>Command preview</strong>
-        ${commandPreviewMarkup(commandPreviewForModule(module))}
+        ${commandPreviewBlockMarkup(module)}
       </div>
       <div class="module-actions">
         <button class="ghost-button compact" type="button" data-preview="${module.id}">Preview</button>
-        <button class="primary-button compact" type="button" data-run="${module.id}">Run</button>
       </div>
     </article>
   `;
@@ -533,6 +2453,15 @@ function ensureSelectedPhase(groups) {
 function renderPhaseTabs() {
   const container = $("#phaseTabs");
   if (!container) return;
+  if (state.catalogSurface === "tools") {
+    container.innerHTML = `
+      <button class="phase-tab${state.toolStatusFilter === "all" ? " active" : ""}" type="button" data-tool-catalog-filter="all">All</button>
+      <button class="phase-tab${state.toolStatusFilter === "installed" ? " active" : ""}" type="button" data-tool-catalog-filter="installed">Installed</button>
+      <button class="phase-tab${state.toolStatusFilter === "missing" ? " active" : ""}" type="button" data-tool-catalog-filter="missing">Missing</button>
+      <button class="phase-tab${state.toolStatusFilter === "conceptual" ? " active" : ""}" type="button" data-tool-catalog-filter="conceptual">Conceptual</button>
+    `;
+    return;
+  }
   if (String(state.moduleSearchQuery || "").trim()) {
     container.innerHTML = "";
     return;
@@ -550,6 +2479,30 @@ function renderPhaseTabs() {
 function renderActivePhaseBar() {
   const container = $("#activePhaseBar");
   if (!container) return;
+  if (state.catalogSurface === "tools") {
+    const filtered = filteredToolCatalogEntries();
+    const summary = state.toolsStatus?.summary || {};
+    container.innerHTML = `
+      <div class="tool-main-toolbar">
+        <div class="tool-main-summary">
+          <span class="active-phase-number">${filtered.length}</span>
+          <div class="tool-main-summary-copy">
+            <strong>${summary.total || filtered.length} total tools</strong>
+            <span>${summary.available || 0} installed di environment aktif</span>
+          </div>
+        </div>
+        <label class="catalog-search tool-main-sort" aria-label="Urutkan tool utama">
+          <select id="mainToolSortSelect">
+            <option value="usage" ${selectedToolSortMode() === "usage" ? "selected" : ""}>Most Used</option>
+            <option value="installed" ${selectedToolSortMode() === "installed" ? "selected" : ""}>Installed First</option>
+            <option value="missing" ${selectedToolSortMode() === "missing" ? "selected" : ""}>Missing First</option>
+            <option value="alpha" ${selectedToolSortMode() === "alpha" ? "selected" : ""}>A-Z</option>
+          </select>
+        </label>
+      </div>
+    `;
+    return;
+  }
   if (String(state.moduleSearchQuery || "").trim()) {
     container.innerHTML = "";
     return;
@@ -570,6 +2523,67 @@ function renderActivePhaseBar() {
 function renderModules() {
   const container = $("#phaseGroups");
   if (!container) return;
+  if (state.catalogSurface === "tools") {
+    renderPhaseTabs();
+    if ((state.toolCatalogLoading || !state.toolCatalogLoaded) && !state.toolingCatalog.length && !Object.keys(state.toolsStatus?.tools || {}).length) {
+      renderActivePhaseBar();
+      container.innerHTML = `
+        <section class="phase-section phase-section-compact">
+          <p class="empty-jobs">Memuat katalog tools...</p>
+        </section>
+      `;
+      queueConsoleHeightSync();
+      return;
+    }
+    renderActivePhaseBar();
+    const filtered = filteredToolCatalogEntries();
+    const total = Object.keys(state.toolsStatus?.tools || {}).length;
+    if (!filtered.length) {
+      container.innerHTML = `
+        <section class="phase-section phase-section-compact">
+          <p class="empty-jobs">Tidak ada tool yang cocok dengan filter saat ini.</p>
+        </section>
+      `;
+      queueConsoleHeightSync();
+      return;
+    }
+    const grouped = filtered.reduce((accumulator, entry) => {
+      if (!accumulator[entry.category]) accumulator[entry.category] = [];
+      accumulator[entry.category].push(entry);
+      return accumulator;
+    }, {});
+    const categoryOrder = ["Discovery", "DNS & Surface", "Web Assessment", "Validation", "Credential", "Post Exploitation", "Detection & Forensics", "Utility", "Other"];
+    const sections = categoryOrder.filter((category) => Array.isArray(grouped[category]) && grouped[category].length);
+    container.innerHTML = sections.map((category) => `
+      <section class="phase-section phase-section-compact tool-phase-section">
+        <div class="phase-title">
+          <span>${String(grouped[category].length).padStart(2, "0")}</span>
+          <h3>${category}</h3>
+        </div>
+        <div class="tool-grid tool-grid-main">
+          ${grouped[category].map(({ label, status }) => `
+            <article class="tool-item tool-item-compact${label === state.selectedToolLabel ? " is-active" : ""}">
+              <div class="tool-item-head">
+                <strong>${label}</strong>
+                <span class="severity-pill severity-${status?.installed ? "low" : status?.kind === "conceptual" ? "info" : "high"}">${status?.installed ? "installed" : status?.kind || "missing"}</span>
+              </div>
+              <div class="tool-item-meta">
+                ${status?.command ? `<span class="module-chip module-chip-soft">${status.command}</span>` : ""}
+                <span class="module-chip module-chip-muted">used in ${toolUsageModules(label).length} modules</span>
+              </div>
+              <div class="assessment-actions-row">
+                <button class="ghost-button compact" type="button" data-select-tool="${label}">Inspect</button>
+                <button class="ghost-button compact" type="button" data-check-tool="${label}">Check</button>
+              </div>
+            </article>
+          `).join("")}
+        </div>
+      </section>
+    `).join("");
+    state.selectedToolLabel = filtered.find((entry) => entry.label === state.selectedToolLabel)?.label || filtered[0]?.label || "";
+    queueConsoleHeightSync();
+    return;
+  }
   const groups = phaseGroupsList();
   ensureSelectedPhase(groups);
   renderPhaseTabs();
@@ -602,7 +2616,7 @@ function renderModules() {
           <h3>${group.label}</h3>
         </div>
         <div class="module-grid">
-          ${modules.map((module) => state.viewMode === "playbook" ? renderPlaybookCard(module) : renderDetailCard(module)).join("")}
+          ${modules.map((module) => renderDetailCard(module)).join("")}
         </div>
       </section>
     `).join("");
@@ -632,10 +2646,18 @@ function renderModules() {
   container.innerHTML = `
     <section class="phase-section phase-section-compact" data-phase="${phaseId}">
       <div class="module-grid">
-        ${filteredModules.map((module) => state.viewMode === "playbook" ? renderPlaybookCard(module) : renderDetailCard(module)).join("")}
+        ${filteredModules.map((module) => renderDetailCard(module)).join("")}
       </div>
     </section>
   `;
+  if (state.highlightedModuleId) {
+    window.setTimeout(() => {
+      const card = document.querySelector(`[data-module-card="${state.highlightedModuleId}"]`);
+      if (card) {
+        card.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }, 40);
+  }
   queueConsoleHeightSync();
 }
 
@@ -673,13 +2695,23 @@ function renderConfig() {
   if (!state.config) return;
   const input = $("#allowedSubnetsInput");
   const meta = $("#configMetaLabel");
+  const saveButton = $("#saveRangesBtn");
   if (input) {
     input.value = (state.config.allowed_subnets || []).join(", ");
   }
   if (meta) {
     const source = state.config.config_source || "unknown";
     const path = state.config.config_path || "-";
-    meta.textContent = `${source} - ${path}`;
+    const passwordState = state.config.range_password_configured
+      ? "range password configured"
+      : "range password optional";
+    meta.textContent = `${source} - ${path} - ${passwordState}`;
+  }
+  if (saveButton) {
+    saveButton.disabled = false;
+    saveButton.title = state.config.range_password_configured
+      ? "Simpan perubahan ranges dengan verifikasi password."
+      : "Simpan perubahan ranges langsung ke konfigurasi backend.";
   }
 }
 
@@ -789,6 +2821,84 @@ function summarizeEvidenceBySeverity(evidence = []) {
 
 function moduleById(moduleId) {
   return state.modules.find((item) => item.id === moduleId) || null;
+}
+
+function toolsForEvidenceItem(item) {
+  const module = moduleById(item?.module_id);
+  const moduleTools = Array.isArray(module?.tooling) ? module.tooling : [];
+  const artifactCommand = String(item?.artifacts?.command || "").trim();
+  const inferredTool = artifactCommand ? inferToolNameFromCommand(artifactCommand, module) : "";
+  const tools = [...moduleTools];
+  if (inferredTool && !tools.includes(inferredTool)) tools.push(inferredTool);
+  return tools.filter(Boolean);
+}
+
+function visibleEvidenceExportPayload() {
+  const activeJob = state.jobs.find((item) => item.id === state.activeJobId) || null;
+  const resolved = resolveVisibleEvidence(activeJob);
+  const evidenceJob = resolved?.evidenceJob || activeJob;
+  const evidence = Array.isArray(resolved?.evidence) ? resolved.evidence : [];
+  const toolsUsed = Array.from(new Set(evidence.flatMap((item) => toolsForEvidenceItem(item))));
+
+  return {
+    exported_at: new Date().toISOString(),
+    source: "visible-evidence-panel",
+    assessment: state.activeAssessment
+      ? {
+          id: state.activeAssessment.id,
+          target: state.activeAssessment.target,
+          target_kind: state.activeAssessment.target_kind || "ip",
+          risk_mode: state.activeAssessment.risk_mode,
+          operator_name: state.activeAssessment.operator_name || "",
+          ticket_ref: state.activeAssessment.ticket_ref || ""
+        }
+      : null,
+    job: evidenceJob
+      ? {
+          id: evidenceJob.id,
+          scope_type: evidenceJob.scope_type,
+          scope_label: evidenceJob.scope_label,
+          target: evidenceJob.target,
+          status: evidenceJob.status,
+          progress: evidenceJob.progress,
+          created_at: evidenceJob.created_at,
+          updated_at: evidenceJob.updated_at
+        }
+      : null,
+    summary: {
+      evidence_count: evidence.length,
+      severity: summarizeEvidenceBySeverity(evidence),
+      tools_used: toolsUsed
+    },
+    evidence: evidence.map((item) => {
+      const module = moduleById(item?.module_id);
+      return {
+        module_id: item?.module_id || "",
+        module_title: item?.module_title || "",
+        phase_label: item?.phase_label || "",
+        severity: item?.severity || "info",
+        summary: item?.summary || "",
+        details: Array.isArray(item?.details) ? item.details : [],
+        execution_profile: item?.execution_profile || "",
+        collected_at: item?.collected_at || "",
+        tools_used: toolsForEvidenceItem(item),
+        command_preview: module ? commandPreviewForModule(module).map((command) => normalizeCommandForTarget(command, evidenceJob?.target || currentTargetValue())) : [],
+        artifacts: item?.artifacts || {}
+      };
+    })
+  };
+}
+
+function downloadJsonFile(filename, payload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function severityRank(key) {
@@ -1334,6 +3444,10 @@ function normalizeCommandForTarget(command, target) {
   if (!safeTarget) return command;
 
   return String(command || "")
+    .replaceAll("target.lab.local", safeTarget)
+    .replaceAll("mail.lab.local", safeTarget)
+    .replaceAll("user@lab.local", `user@${safeTarget}`)
+    .replaceAll("redteam@lab.local", `redteam@${safeTarget}`)
     .replaceAll("https://lab.local", `https://${safeTarget}`)
     .replaceAll("http://lab.local", `http://${safeTarget}`)
     .replaceAll("ssh://target", `ssh://${safeTarget}`)
@@ -1349,6 +3463,7 @@ function normalizeCommandForTarget(command, target) {
 function renderTimeline(job) {
   const container = $("#timelineList");
   const label = $("#timelineCountLabel");
+  if (!container || !label) return;
   const runs = (job?.module_runs || []).filter((run) => {
     const status = String(run?.status || "");
     const evidenceCount = Number(run?.evidence_count || 0);
@@ -1436,9 +3551,11 @@ function renderTimeline(job) {
 function renderEvidence(job, resolved = resolveVisibleEvidence(job)) {
   const container = $("#evidenceList");
   const label = $("#evidenceCountLabel");
+  const exportButton = $("#exportVisibleEvidenceBtn");
   const evidenceJob = resolved?.evidenceJob || job;
   const evidence = Array.isArray(resolved?.evidence) ? resolved.evidence : [];
   label.textContent = `${evidence.length} items`;
+  if (exportButton) exportButton.disabled = !evidence.length;
 
   if (!evidence.length) {
     container.innerHTML = `<p class="empty-jobs">Evidence akan muncul setelah modul mulai menghasilkan temuan.</p>`;
@@ -1465,6 +3582,21 @@ function renderEvidence(job, resolved = resolveVisibleEvidence(job)) {
       <div class="evidence-detail-row severity-border-${level}">
         <span class="severity-pill severity-${level}">${level}</span>
         <p class="evidence-detail evidence-detail-code">${text}</p>
+      </div>
+    `;
+  };
+
+  const toolsMarkup = (item) => {
+    const tools = Array.from(new Set(
+      ((Array.isArray(item?.tools_used) ? item.tools_used : []).concat(toolsForEvidenceItem(item)))
+        .map((tool) => String(tool || "").trim())
+        .filter(Boolean)
+    ));
+    if (!tools.length) return "";
+    return `
+      <div class="evidence-tools">
+        <strong>Tools</strong>
+        <div class="timeline-chip-row">${tools.map((tool) => `<span class="timeline-chip timeline-chip-tool">${tool}</span>`).join("")}</div>
       </div>
     `;
   };
@@ -1507,6 +3639,7 @@ function renderEvidence(job, resolved = resolveVisibleEvidence(job)) {
         <strong>${item.summary}</strong>
         <span class="severity-pill severity-${item.severity}">${item.severity}</span>
       </div>
+      ${toolsMarkup(item)}
       ${itemDetailMarkup(item)}
       <small>${item.module_title} - ${item.phase_label}</small>
     </article>
@@ -1519,9 +3652,15 @@ function renderJobProgress(job) {
   $("#jobProgressBar").style.width = `${progress}%`;
   const hasJob = Boolean(job);
   $("#viewHtmlBtn").disabled = !hasJob;
+  $("#viewJobEvidenceBtn").disabled = !hasJob;
+  $("#viewJobMarkdownBtn").disabled = !hasJob;
 }
 
 function renderConsole(job) {
+  if (state.activeInteractiveSession) {
+    renderInteractiveConsoleSession(state.activeInteractiveSession);
+    return;
+  }
   const output = $("#consoleOutput");
   const activeLabel = $("#activeJobLabel");
   const commandLabel = $("#activeCommandLabel");
@@ -1561,6 +3700,7 @@ function renderConsole(job) {
 async function loadConfig() {
   state.config = await api("/api/config");
   renderConfig();
+  renderDestructiveActions();
 }
 
 function readAllowedSubnets() {
@@ -1573,10 +3713,13 @@ function readAllowedSubnets() {
 async function saveAllowedSubnets() {
   try {
     const allowedSubnets = readAllowedSubnets();
-    const password = await requestRangePassword();
-    if (!password) {
-      showToast("Simpan ranges dibatalkan.");
-      return;
+    let password = "";
+    if (state.config?.range_password_configured) {
+      password = await requestRangePassword();
+      if (!password) {
+        showToast("Simpan ranges dibatalkan.");
+        return;
+      }
     }
     const result = await api("/api/config/allowed-subnets", {
       method: "POST",
@@ -1601,11 +3744,265 @@ async function reloadConfig() {
   }
 }
 
-async function loadModules() {
+async function loadModules(forceRefresh = false) {
+  const cachedModules = !forceRefresh ? readModulesCache() : null;
+  if (cachedModules?.length) {
+    state.modules = cachedModules;
+    syncModuleProfileSelect();
+    scheduleModulesRender();
+    scheduleDeferredTask(async () => {
+      try {
+        const refresh = await api("/api/modules");
+        const freshModules = Array.isArray(refresh?.modules) ? refresh.modules : [];
+        if (!freshModules.length) return;
+        state.modules = freshModules;
+        writeModulesCache(freshModules);
+        syncModuleProfileSelect();
+        scheduleModulesRender();
+      } catch (error) {
+        console.warn(error);
+      }
+    });
+    return;
+  }
+
   const result = await api("/api/modules");
   state.modules = result.modules;
+  writeModulesCache(result.modules);
   syncModuleProfileSelect();
-  renderModules();
+  scheduleModulesRender();
+}
+
+async function loadChainPresets() {
+  const result = await api("/api/chain-presets");
+  state.chainPresets = Array.isArray(result.presets) ? result.presets : [];
+  renderChainPresetSelect();
+  renderChainPresetList();
+}
+
+async function loadToolingHealth() {
+  const [catalogResult, statusResult] = await Promise.all([
+    apiOptional("/api/tooling", { tools: [] }),
+    apiOptional("/api/tools/status", { tools: {}, summary: {} })
+  ]);
+  state.toolingCatalog = Array.isArray(catalogResult.tools) ? catalogResult.tools : [];
+  state.toolsStatus = statusResult || null;
+  renderToolingHealth();
+  if (state.catalogSurface === "tools") {
+    scheduleModulesRender();
+  }
+}
+
+async function loadReferenceData() {
+  const [engagementResult, findingResult, assetResult] = await Promise.all([
+    apiOptional("/api/engagements", { engagements: [] }),
+    apiOptional("/api/findings", { findings: [] }),
+    apiOptional("/api/assets", { assets: [] })
+  ]);
+  state.engagements = Array.isArray(engagementResult.engagements) ? engagementResult.engagements : [];
+  state.referenceFindings = Array.isArray(findingResult.findings) ? findingResult.findings : [];
+  state.assets = Array.isArray(assetResult.assets) ? assetResult.assets : [];
+  renderReferenceData();
+}
+
+async function loadTargetAsset() {
+  const target = currentTargetValue();
+  const targetKey = `${currentTargetKind()}::${target}`;
+  if (!target) {
+    state.targetAsset = null;
+    state.lastTargetAssetKey = "";
+    renderTargetAsset();
+    return;
+  }
+  if (state.lastTargetAssetKey === targetKey) {
+    renderTargetAsset();
+    return;
+  }
+  const requestSeq = ++state.targetAssetRequestSeq;
+  try {
+    const result = await api(`/api/assets/${encodeURIComponent(target)}`);
+    if (requestSeq !== state.targetAssetRequestSeq) return;
+    state.targetAsset = result.asset || null;
+  } catch (error) {
+    if (requestSeq !== state.targetAssetRequestSeq) return;
+    state.targetAsset = null;
+  }
+  state.lastTargetAssetKey = targetKey;
+  renderTargetAsset();
+}
+
+async function loadDestructiveActions() {
+  const result = await apiOptional("/api/destructive/actions", { actions: [] });
+  state.destructiveActions = Array.isArray(result.actions) ? result.actions : [];
+  renderDestructiveActions();
+}
+
+async function loadAssessments() {
+  const result = await api("/api/assessments");
+  state.assessments = Array.isArray(result.assessments) ? result.assessments : [];
+  if (!state.activeAssessmentId && state.assessments.length) {
+    state.activeAssessmentId = state.assessments[0].id;
+  }
+  if (state.activeAssessmentId) {
+    await loadAssessment(state.activeAssessmentId);
+  } else {
+    state.activeAssessment = null;
+    state.activeApprovals = [];
+    state.activeRecommendations = null;
+    state.activeFindings = [];
+    state.activeFindingSummary = null;
+    state.activeAssessmentDetail = null;
+    state.activeCorrelation = null;
+    state.activeWorkspace = null;
+    state.activeDiff = null;
+    state.activeDrift = null;
+    state.workspacePreviewPath = "";
+    renderAssessmentSummary();
+    renderAssessmentFindings();
+    renderApprovalQueue();
+    renderApprovalsDashboard();
+    renderAssessmentLibrary();
+    renderWorkspaceBrowser();
+    renderAssessmentExportButtons();
+  }
+  renderAssessmentLibrary();
+}
+
+async function loadAssessment(assessmentId) {
+  const result = await api(`/api/assessments/${assessmentId}`);
+  state.activeAssessmentId = result.assessment.id;
+  state.activeAssessment = result.assessment;
+  state.activeApprovals = Array.isArray(result.approvals) ? result.approvals : [];
+  state.activeRecommendations = result.recommendations || null;
+  state.activeFindings = Array.isArray(result.findings) ? result.findings : [];
+  state.activeFindingSummary = result.finding_summary || null;
+  state.activeAssessmentDetail = result.detail || null;
+  state.activeCorrelation = result.correlation || null;
+  state.activeWorkspace = result.workspace || null;
+  state.activeDiff = result.diff || null;
+  state.activeDrift = result.drift || null;
+  state.approvalsDashboard = result.approvals_dashboard || state.approvalsDashboard;
+  setModuleExecutionProfile(profileForRiskMode(result.assessment.risk_mode || "safe"));
+  if ($("#targetKindSelect")) {
+    $("#targetKindSelect").value = result.assessment.target_kind === "url" ? "url" : "ip";
+  }
+  if ($("#targetInput")) {
+    $("#targetInput").value = result.assessment.target || currentTargetValue();
+    persistLastTarget(result.assessment.target || "");
+  }
+  if ($("#operatorNameInput")) {
+    $("#operatorNameInput").value = result.assessment.operator_name || "operator";
+  }
+  if ($("#ticketRefInput")) {
+    $("#ticketRefInput").value = result.assessment.ticket_ref || "";
+  }
+  renderAssessmentSummary();
+  renderAssessmentFindings();
+  renderApprovalQueue();
+  renderApprovalsDashboard();
+  renderChainPresetList();
+  renderAssessmentLibrary();
+  renderWorkspaceBrowser();
+  renderAssessmentExportButtons();
+  await loadTargetAsset();
+}
+
+function assessmentMatchesPayload(assessment, payload) {
+  if (!assessment || !payload) return false;
+  return assessment.target === payload.target
+    && (assessment.target_kind || "ip") === payload.target_kind
+    && assessment.risk_mode === payload.risk_mode;
+}
+
+async function createAssessment(payloadOverride = null) {
+  try {
+    const payload = payloadOverride || readTargetPayload();
+    const result = await api("/api/assessments", {
+      method: "POST",
+      body: JSON.stringify({
+        target: payload.target,
+        target_kind: payload.target_kind,
+        assessment_type: "internal",
+        risk_mode: payload.risk_mode,
+        chain_preset: payload.chain_preset,
+        operator_name: payload.operator_name,
+        ticket_ref: payload.ticket_ref,
+        note: payload.note
+      })
+    });
+    state.activeAssessmentId = result.assessment.id;
+    state.assessments = [
+      result.assessment,
+      ...state.assessments.filter((item) => item.id !== result.assessment.id)
+    ];
+    renderAssessmentLibrary();
+    await loadAssessment(result.assessment.id);
+    showToast(`Assessment ${result.assessment.id.slice(0, 8)} dibuat.`);
+    return result.assessment;
+  } catch (error) {
+    showToast(error.message);
+    return null;
+  }
+}
+
+async function ensureAssessmentForRiskMode(riskMode, payloadOverride = null) {
+  const payload = payloadOverride || readTargetPayload();
+  const desiredPayload = { ...payload, risk_mode: riskMode };
+  if (assessmentMatchesPayload(state.activeAssessment, desiredPayload)) {
+    return state.activeAssessment;
+  }
+  if (riskMode === "safe") {
+    return null;
+  }
+  return await createAssessment(desiredPayload);
+}
+
+async function ensureModuleApproval(moduleId, payloadOverride = null) {
+  return true;
+}
+
+async function ensureChainApproval(riskMode, chainPreset, payloadOverride = null) {
+  return true;
+}
+
+async function approveAllPendingModules() {
+  if (!state.activeAssessmentId || !state.activeAssessment) return;
+  const approved = await ensureChainApproval(
+    state.activeAssessment.risk_mode || activeAssessmentRiskMode(),
+    state.activeAssessment?.metadata?.chain_preset || selectedChainPreset()
+  );
+  if (approved && state.activeAssessmentId) {
+    await loadAssessment(state.activeAssessmentId);
+  }
+}
+
+async function updateFindingStatus(findingId, status) {
+  if (!state.activeAssessmentId) return;
+  try {
+    const note = window.prompt(`Catatan status untuk ${status}`, "") || "";
+    const defaults = remediationPromptDefaults(findingId);
+    const owner = window.prompt("Owner remediation", defaults.owner) || "";
+    const due_date = window.prompt("Due date ISO (contoh 2026-07-15T17:00:00+07:00)", defaults.due_date) || "";
+    const sla = window.prompt("SLA (contoh P1-3hari)", defaults.sla) || "";
+    const result = await api(`/api/assessments/${state.activeAssessmentId}/findings/${findingId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status, note, owner, due_date, sla })
+    });
+    state.activeFindingSummary = result.summary || state.activeFindingSummary;
+    state.activeDiff = result.diff || state.activeDiff;
+    state.activeAssessmentDetail = result.detail || state.activeAssessmentDetail;
+    await loadAssessment(state.activeAssessmentId);
+    showToast(`Status finding diubah ke ${status}.`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function approveModuleFromQueue(moduleId) {
+  const approved = await ensureModuleApproval(moduleId);
+  if (approved && state.activeAssessmentId) {
+    await loadAssessment(state.activeAssessmentId);
+  }
 }
 
 async function loadJobs() {
@@ -1622,8 +4019,18 @@ async function loadJobs() {
 async function loadJob(jobId) {
   const result = await api(`/api/jobs/${jobId}`);
   state.activeJobId = result.job.id;
+  if (state.activeRecommendations && Array.isArray(result.recommendations)) {
+    state.activeRecommendations = {
+      ...(state.activeRecommendations || {}),
+      recommended_modules: result.recommendations
+    };
+    renderAssessmentSummary();
+  }
   renderConsole(result.job);
   renderJobs();
+  if (state.activeAssessmentId && result.job?.runtime_meta?.assessment_id === state.activeAssessmentId) {
+    await loadAssessment(state.activeAssessmentId);
+  }
 
   const activeStates = new Set(["pending", "running"]);
   window.clearTimeout(state.pollTimer);
@@ -1694,24 +4101,46 @@ async function clearJobs() {
 
 function readTargetPayload() {
   const target = $("#targetInput").value.trim();
+  const target_kind = currentTargetKind();
+  const risk_mode = selectedRiskMode();
+  const activeAssessmentMatches = assessmentMatchesPayload(state.activeAssessment, {
+    target,
+    target_kind,
+    risk_mode
+  });
   persistLastTarget(target);
   return {
     target,
+    target_kind,
     note: `Phase filter: ${state.selectedPhase}`,
-    execution_profile: selectedModuleProfile()
+    execution_profile: selectedModuleProfile(),
+    chain_preset: selectedChainPreset(),
+    risk_mode,
+    operator_name: currentOperatorName(),
+    ticket_ref: currentTicketRef(),
+    assessment_id: activeAssessmentMatches ? (state.activeAssessmentId || "") : ""
   };
 }
 
 async function runModule(moduleId) {
   try {
     const payload = readTargetPayload();
+    const module = state.modules.find((item) => item.id === moduleId);
+    if (!module) throw new Error("Module tidak ditemukan.");
+    if (payload.risk_mode !== "safe") {
+      const assessment = await ensureAssessmentForRiskMode(payload.risk_mode, payload);
+      payload.assessment_id = assessment?.id || payload.assessment_id || "";
+    }
     const result = await api("/api/jobs", {
       method: "POST",
       body: JSON.stringify({
         module_id: moduleId,
         target: payload.target,
+        target_kind: payload.target_kind,
         note: payload.note,
-        execution_profile: payload.execution_profile
+        execution_profile: payload.execution_profile,
+        assessment_id: payload.assessment_id,
+        risk_mode: payload.risk_mode
       })
     });
     showToast("Job berhasil dibuat.");
@@ -1723,21 +4152,53 @@ async function runModule(moduleId) {
 }
 
 async function runFullChain() {
+  if (state.chainRunPending) {
+    showToast("Full simulation chain sedang diproses. Tunggu tahap saat ini selesai.");
+    return;
+  }
   try {
+    window.clearTimeout(state.chainRunUiTimer);
+    setRunChainUiState("preflight", "Memvalidasi target, profile, dan koneksi backend...");
+    showToast("Memvalidasi target dan menyiapkan full chain...");
     const payload = readTargetPayload();
+    let assessment = assessmentMatchesPayload(state.activeAssessment, payload)
+      ? state.activeAssessment
+      : null;
+
+    if (!assessment) {
+      setRunChainUiState("assessment", "Membuat assessment aktif untuk target dan mode yang dipilih...");
+      showToast("Membuat assessment aktif...");
+      assessment = await createAssessment(payload);
+      if (!assessment?.id) {
+        throw new Error("Assessment aktif gagal dibuat.");
+      }
+    }
+
+    payload.assessment_id = assessment.id || "";
+
+    setRunChainUiState("submitting", "Mengirim full simulation chain ke backend worker...");
+    showToast("Mengirim full simulation chain ke backend tanpa approval queue...");
     const result = await api("/api/jobs/full-chain", {
       method: "POST",
       body: JSON.stringify({
         target: payload.target,
+        target_kind: payload.target_kind,
         note: payload.note,
-        execution_profile: payload.execution_profile
+        execution_profile: payload.execution_profile,
+        assessment_id: payload.assessment_id,
+        risk_mode: payload.risk_mode,
+        chain_preset: payload.chain_preset
       })
     });
-    showToast(`Pentest IP ${payload.target} dimulai dengan profile ${payload.execution_profile}.`);
+    setRunChainUiState("success", "Job full chain berhasil dibuat. Membuka live console terbaru...");
+    showToast(`Assessment ${payload.target} dimulai dengan profile ${payload.execution_profile} dan mode ${payload.risk_mode}.`);
     await loadJobs();
     await loadJob(result.job.id);
+    state.chainRunUiTimer = window.setTimeout(() => setRunChainUiState("idle"), 2800);
   } catch (error) {
+    setRunChainUiState("error", `Full chain gagal: ${error.message}`);
     showToast(error.message);
+    state.chainRunUiTimer = window.setTimeout(() => setRunChainUiState("idle"), 3200);
   }
 }
 
@@ -1748,8 +4209,8 @@ async function previewModule(moduleId) {
   const payload = readTargetPayload();
   let dryRun = null;
   try {
-    const result = await api(`/api/modules/${moduleId}/dry-run?target=${encodeURIComponent(payload.target)}&note=${encodeURIComponent(payload.note)}&execution_profile=${encodeURIComponent(payload.execution_profile)}`);
-    dryRun = result.dry_run;
+    const cached = await fetchModuleDryRunData(moduleId);
+    dryRun = cached?.dry_run || null;
   } catch (error) {
     showToast(error.message);
   }
@@ -1800,7 +4261,7 @@ async function previewModule(moduleId) {
 
 async function viewHtmlReport() {
   if (!state.activeJobId) return;
-  const reportUrl = `/api/jobs/${state.activeJobId}/report.html`;
+  const reportUrl = apiUrl(`/api/jobs/${state.activeJobId}/report.html`);
   const opened = window.open(reportUrl, "_blank", "noopener,noreferrer");
   if (!opened) {
     showToast("Popup diblokir browser. Izinkan tab baru untuk melihat report HTML.");
@@ -1809,15 +4270,242 @@ async function viewHtmlReport() {
   showToast("Report HTML dibuka di tab baru.");
 }
 
+function openUrlInNewTab(url, successMessage) {
+  const opened = window.open(apiUrl(url), "_blank", "noopener,noreferrer");
+  if (!opened) {
+    showToast("Popup diblokir browser. Izinkan tab baru untuk membuka artefak.");
+    return;
+  }
+  if (successMessage) showToast(successMessage);
+}
+
+function viewJobEvidence() {
+  if (!state.activeJobId) return;
+  openUrlInNewTab(`/api/jobs/${state.activeJobId}/evidence`, "Evidence job dibuka di tab baru.");
+}
+
+function viewJobMarkdown() {
+  if (!state.activeJobId) return;
+  openUrlInNewTab(`/api/jobs/${state.activeJobId}/report.md`, "Report markdown job dibuka di tab baru.");
+}
+
+function viewAssessmentEvidence() {
+  if (!state.activeAssessmentId) return;
+  openUrlInNewTab(`/api/assessments/${state.activeAssessmentId}/evidence`, "Assessment evidence dibuka di tab baru.");
+}
+
+function viewAssessmentMarkdown() {
+  if (!state.activeAssessmentId) return;
+  openUrlInNewTab(`/api/assessments/${state.activeAssessmentId}/report.md`, "Assessment markdown dibuka di tab baru.");
+}
+
+function viewAssessmentHtml() {
+  if (!state.activeAssessmentId) return;
+  openUrlInNewTab(`/api/assessments/${state.activeAssessmentId}/report.html`, "Assessment HTML dibuka di tab baru.");
+}
+
+function exportVisibleEvidenceJson() {
+  const payload = visibleEvidenceExportPayload();
+  if (!payload.evidence.length) {
+    showToast("Belum ada evidence yang bisa diekspor.");
+    return;
+  }
+  const targetLabel = String(payload.job?.target || payload.assessment?.target || "target")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    || "target";
+  downloadJsonFile(`evidence-highlights-${targetLabel}.json`, payload);
+  showToast("Evidence JSON berhasil diekspor.");
+}
+
+async function refreshWorkspace() {
+  if (!state.activeAssessmentId) return;
+  const result = await api(`/api/assessments/${state.activeAssessmentId}/workspace`);
+  state.activeWorkspace = result.workspace || null;
+  renderWorkspaceBrowser();
+}
+
+async function openWorkspaceFile(path) {
+  if (!state.activeAssessmentId || !path) return;
+  const result = await api(`/api/assessments/${state.activeAssessmentId}/workspace/file?path=${encodeURIComponent(path)}`);
+  state.workspacePreviewPath = result.file?.path || path;
+  $("#workspacePreviewTitle").textContent = result.file?.name || path;
+  $("#workspacePreviewMeta").textContent = `${result.file?.mime || "text/plain"} - ${result.file?.path || path}`;
+  $("#workspacePreviewContent").textContent = result.file?.content || "";
+}
+
+async function parseImportedOutput() {
+  try {
+    const payload = readTargetPayload();
+  const result = await api("/api/imports/parse", {
+      method: "POST",
+      body: JSON.stringify({
+        tool_name: $("#importToolSelect")?.value || "generic",
+        target: payload.target,
+        target_kind: payload.target_kind,
+        content: $("#importContentInput")?.value || ""
+      })
+    });
+    state.importResult = result.result || null;
+    renderImportResult();
+    showToast("Output tool berhasil diparse.");
+    openImportParserModal();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function checkSingleTool(toolName) {
+  try {
+    const result = await api(`/api/tools/check/${encodeURIComponent(toolName)}`);
+    const tools = { ...(state.toolsStatus?.tools || {}), [toolName]: result };
+    state.toolsStatus = {
+      ...(state.toolsStatus || {}),
+      tools
+    };
+    renderToolingHealth();
+    showToast(`Status tool ${toolName} diperbarui.`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function jumpToModuleFromTool(moduleId) {
+  const module = (state.modules || []).find((item) => item.id === moduleId);
+  if (!module) return;
+  state.selectedPhase = module.phase_id;
+  state.highlightedModuleId = moduleId;
+  renderModules();
+  animatePhaseSwap();
+  document.querySelector(".module-pane")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  window.setTimeout(() => {
+    state.highlightedModuleId = "";
+    renderModules();
+  }, 2600);
+}
+
+async function approveDestructiveAction(actionId) {
+  if (!state.activeAssessmentId) {
+    showToast("Buat atau pilih assessment intrusive terlebih dahulu.");
+    return;
+  }
+  try {
+    const reason = window.prompt(`Alasan destructive approval untuk ${actionId}`, `Approved destructive action ${actionId}`) || "";
+    const result = await api(`/api/assessments/${state.activeAssessmentId}/approve-destructive`, {
+      method: "POST",
+      body: JSON.stringify({
+        action: actionId,
+        approved_by: currentOperatorName(),
+        ticket_ref: currentTicketRef(),
+        reason
+      })
+    });
+    state.activeApprovals = [result.approval, ...state.activeApprovals];
+    renderApprovalsDashboard();
+    renderAssessmentSummary();
+    showToast(`Approval destructive ${actionId} tersimpan.`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function executeDestructiveAction(actionId) {
+  if (!state.activeAssessmentId) {
+    showToast("Pilih assessment aktif terlebih dahulu.");
+    return;
+  }
+  const approval = (state.activeApprovals || []).find((item) => item.metadata?.action === actionId);
+  if (!approval?.metadata?.confirmation_token) {
+    showToast("Approval destructive belum ada. Simpan approval dulu.");
+    return;
+  }
+  try {
+    const result = await api("/api/destructive/execute", {
+      method: "POST",
+      body: JSON.stringify({
+        action: actionId,
+        target: currentTargetValue(),
+        assessment_id: state.activeAssessmentId,
+        confirmation_token: approval.metadata.confirmation_token
+      })
+    });
+    state.destructiveResult = [
+      `Action     : ${result.action}`,
+      `Success    : ${result.success}`,
+      `Target     : ${result.target}`,
+      `Approved By: ${result.approved_by || "-"}`,
+      `Ticket Ref : ${result.ticket_ref || "-"}`,
+      "",
+      "Command:",
+      result.command || "-",
+      "",
+      "Output:",
+      result.output || "-"
+    ].join("\n");
+    renderDestructiveActions();
+    showToast(`Destructive action ${actionId} dieksekusi.`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 function bindEvents() {
-  $("#phaseGroups").addEventListener("click", (event) => {
-    const runId = event.target.dataset.run;
-    const previewId = event.target.dataset.preview;
+  $("#logoutBtn")?.addEventListener("click", async () => {
+    try {
+      await fetch("/logout", {
+        method: "POST",
+        credentials: "same-origin"
+      });
+    } finally {
+      window.location.href = "/login";
+    }
+  });
+  $("#phaseGroups")?.addEventListener("click", (event) => {
+    const selectedTool = event.target.closest?.("[data-select-tool]")?.dataset?.selectTool;
+    if (selectedTool) {
+      state.selectedToolLabel = selectedTool;
+      const entry = activeToolEntry();
+      openToolInspectModal(entry?.label || selectedTool, entry?.status || null);
+      return;
+    }
+    const checkTool = event.target.closest?.("[data-check-tool]")?.dataset?.checkTool;
+    if (checkTool) {
+      checkSingleTool(checkTool);
+      return;
+    }
+    const expandCommandsButton = event.target.closest?.("[data-expand-module-commands]")?.dataset?.expandModuleCommands;
+    if (expandCommandsButton) {
+      fetchModuleDryRunData(expandCommandsButton)
+        .then(() => {
+          setModuleCommandsExpanded(expandCommandsButton, true);
+          scheduleModulesRender();
+        })
+        .catch((error) => showToast(error.message || "Gagal memuat command preview."));
+      return;
+    }
+    const copyCommandButton = event.target.closest?.("[data-copy-module-command]");
+    if (copyCommandButton) {
+      copyModuleCommand(copyCommandButton).catch((error) => showToast(error.message || "Gagal copy command."));
+      return;
+    }
+    const runCommandButton = event.target.closest?.("[data-run-module-command]");
+    if (runCommandButton) {
+      executeModuleCommandCard(runCommandButton);
+      return;
+    }
+    const openInteractiveModuleButton = event.target.closest?.("[data-open-module-console]");
+    if (openInteractiveModuleButton) {
+      openModuleCommandInLiveConsole(openInteractiveModuleButton)
+        .catch((error) => showToast(error.message || "Gagal membuka live console."));
+      return;
+    }
+    const runId = event.target.closest?.("[data-run]")?.dataset?.run;
+    const previewId = event.target.closest?.("[data-preview]")?.dataset?.preview;
     if (runId) runModule(runId);
     if (previewId) previewModule(previewId);
   });
 
-  $("#jobList").addEventListener("click", (event) => {
+  $("#jobList")?.addEventListener("click", (event) => {
     const stopButton = event.target.closest("[data-stop-job]");
     if (stopButton) {
       event.stopPropagation();
@@ -1840,14 +4528,171 @@ function bindEvents() {
     loadJob(button.dataset.job);
   });
 
-  $("#runChainBtn").addEventListener("click", runFullChain);
-  $("#refreshModulesBtn").addEventListener("click", async () => {
-    await loadModules();
-    showToast("Catalog modul diperbarui.");
+  $("#runChainBtn")?.addEventListener("click", runFullChain);
+  $("#refreshAssessmentsBtn")?.addEventListener("click", loadAssessments);
+  $("#refreshWorkspaceBtn")?.addEventListener("click", refreshWorkspace);
+  $("#refreshToolsBtn")?.addEventListener("click", loadToolingHealth);
+  $("#refreshAssetsBtn")?.addEventListener("click", async () => {
+    await loadTargetAsset();
   });
-  $("#reloadConfigBtn").addEventListener("click", reloadConfig);
-  $("#saveRangesBtn").addEventListener("click", saveAllowedSubnets);
-  $("#phaseTabs").addEventListener("click", (event) => {
+  $("#reloadConfigBtn")?.addEventListener("click", reloadConfig);
+  $("#saveRangesBtn")?.addEventListener("click", saveAllowedSubnets);
+  $("#viewAssessmentEvidenceBtn")?.addEventListener("click", viewAssessmentEvidence);
+  $("#exportVisibleEvidenceBtn")?.addEventListener("click", exportVisibleEvidenceJson);
+  $("#viewAssessmentMarkdownBtn")?.addEventListener("click", viewAssessmentMarkdown);
+  $("#viewAssessmentHtmlBtn")?.addEventListener("click", viewAssessmentHtml);
+  $("#assessmentFindings")?.addEventListener("click", async (event) => {
+    const action = event.target?.dataset?.findingAction;
+    const findingId = event.target?.dataset?.findingId;
+    if (!action || !findingId) return;
+    await updateFindingStatus(findingId, action);
+  });
+  $("#assessmentList")?.addEventListener("click", async (event) => {
+    const assessmentId = event.target?.dataset?.selectAssessment;
+    if (!assessmentId) return;
+    await loadAssessment(assessmentId);
+  });
+  $("#approvalQueueList")?.addEventListener("click", async (event) => {
+    const approveAll = event.target?.dataset?.approveAllModules;
+    if (approveAll !== undefined) {
+      await approveAllPendingModules();
+      return;
+    }
+    const moduleId = event.target?.dataset?.approveModule;
+    if (!moduleId) return;
+    await approveModuleFromQueue(moduleId);
+  });
+  $("#workspaceSections")?.addEventListener("click", async (event) => {
+    const path = event.target?.dataset?.workspaceFile;
+    if (!path) return;
+    await openWorkspaceFile(path);
+  });
+  $("#toolHealthList")?.addEventListener("click", async (event) => {
+    const selectedTool = event.target.closest?.("[data-select-tool]")?.dataset?.selectTool;
+    if (selectedTool) {
+      state.selectedToolLabel = selectedTool;
+      renderToolingHealth();
+      const entry = activeToolEntry();
+      openToolInspectModal(entry?.label || selectedTool, entry?.status || null);
+      return;
+    }
+    const toolName = event.target.closest?.("[data-check-tool]")?.dataset?.checkTool;
+    if (!toolName) return;
+    await checkSingleTool(toolName);
+  });
+  $("#toolInspectModules")?.addEventListener("click", (event) => {
+    const moduleId = event.target?.dataset?.jumpModule;
+    if (!moduleId) return;
+    closeToolInspectModal();
+    jumpToModuleFromTool(moduleId);
+  });
+  $("#openImportModalBtn")?.addEventListener("click", openImportParserModal);
+  $("#closeImportModalBtn")?.addEventListener("click", closeImportParserModal);
+  $("#clearImportModalBtn")?.addEventListener("click", clearImportParserModal);
+  $("#closeToolInspectBtn")?.addEventListener("click", closeToolInspectModal);
+  $("#toolInspectModal")?.addEventListener("click", (event) => {
+    const copyButton = event.target.closest?.("[data-copy-tool-command]");
+    if (copyButton) {
+      copyToolCommand(copyButton).catch((error) => showToast(error.message || "Gagal copy command."));
+      return;
+    }
+    const runButton = event.target.closest?.("[data-run-tool-command]");
+    if (runButton) {
+      executeToolCommandCard(runButton);
+      return;
+    }
+    const openInteractiveButton = event.target.closest?.("[data-open-tool-console]");
+    if (openInteractiveButton) {
+      openToolCommandInLiveConsole(openInteractiveButton)
+        .catch((error) => showToast(error.message || "Gagal membuka live console."));
+      return;
+    }
+    if (event.target?.id === "toolInspectModal") {
+      closeToolInspectModal();
+    }
+  });
+  $("#sendInteractiveConsoleBtn")?.addEventListener("click", () => {
+    sendInteractiveConsoleInput().catch((error) => showToast(error.message || "Gagal mengirim command."));
+  });
+  $("#interactiveConsoleInput")?.addEventListener("keydown", (event) => {
+    if (event.key === "Tab") {
+      event.preventDefault();
+      applyInteractiveTabCompletion(event.currentTarget);
+      return;
+    }
+    if (!isPlainEnterKey(event)) return;
+    event.preventDefault();
+    sendInteractiveConsoleInput().catch((error) => showToast(error.message || "Gagal mengirim command."));
+  });
+  $("#interactiveConsoleInput")?.addEventListener("keypress", (event) => {
+    if (!isPlainEnterKey(event)) return;
+    event.preventDefault();
+    sendInteractiveConsoleInput().catch((error) => showToast(error.message || "Gagal mengirim command."));
+  });
+  $("#interactiveConsoleInput")?.addEventListener("input", () => {
+    resetInteractiveTabState();
+    updateInteractiveHintLabel();
+  });
+  $("#closeInteractiveConsoleBtn")?.addEventListener("click", () => {
+    closeInteractiveConsoleSession().catch((error) => showToast(error.message || "Gagal menutup live console."));
+  });
+  $("#toggleTerminalFullscreenBtn")?.addEventListener("click", () => {
+    setTerminalFullscreen().catch((error) => showToast(error.message || "Gagal membuka full screen."));
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const panel = document.querySelector('.insight-panel[data-insight-panel="console"]');
+    if (!panel?.classList.contains("console-fullscreen")) return;
+    setTerminalFullscreen(false).catch(() => {});
+  });
+  document.addEventListener("fullscreenchange", () => {
+    const panel = document.querySelector('.insight-panel[data-insight-panel="console"]');
+    const button = $("#toggleTerminalFullscreenBtn");
+    const active = document.fullscreenElement === panel || panel?.classList.contains("console-fullscreen");
+    if (button) {
+      button.textContent = active ? "Exit Full Screen" : "Full Screen";
+      button.setAttribute("aria-pressed", active ? "true" : "false");
+    }
+    document.body.classList.toggle("terminal-fullscreen-open", Boolean(active));
+  });
+  $("#importParserModal")?.addEventListener("click", (event) => {
+    if (event.target?.id === "importParserModal") {
+      closeImportParserModal();
+    }
+  });
+  $("#toolSearchInput")?.addEventListener("input", (event) => {
+    state.toolSearchQuery = event.target.value || "";
+    debouncedToolingHealthRender();
+  });
+  $("#toolFilterRow")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-tool-filter]");
+    if (!button) return;
+    state.toolStatusFilter = button.dataset.toolFilter || "all";
+    renderToolingHealth();
+  });
+  $("#toolSortSelect")?.addEventListener("change", (event) => {
+    state.toolSortMode = event.target.value || "usage";
+    renderToolingHealth();
+  });
+  $("#parseImportBtn")?.addEventListener("click", parseImportedOutput);
+  $("#destructiveActionsList")?.addEventListener("click", async (event) => {
+    const approveId = event.target?.dataset?.approveDestructive;
+    const executeId = event.target?.dataset?.executeDestructive;
+    if (approveId) {
+      await approveDestructiveAction(approveId);
+      return;
+    }
+    if (executeId) {
+      await executeDestructiveAction(executeId);
+    }
+  });
+  $("#phaseTabs")?.addEventListener("click", (event) => {
+    const toolFilter = event.target.closest("[data-tool-catalog-filter]")?.dataset?.toolCatalogFilter;
+    if (toolFilter) {
+      state.toolStatusFilter = toolFilter;
+      renderModules();
+      return;
+    }
     const button = event.target.closest("[data-phase-tab]");
     if (!button) return;
     if (state.selectedPhase === button.dataset.phaseTab) return;
@@ -1855,45 +4700,94 @@ function bindEvents() {
     renderModules();
     animatePhaseSwap();
   });
-  $("#playbookViewBtn").addEventListener("click", () => {
-    setViewMode("playbook");
+  $("#operationsTabRow")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-operations-tab]");
+    if (!button) return;
+    setOperationsTab(button.dataset.operationsTab || "workspace");
+  });
+  $("#toggleOperationsBtn")?.addEventListener("click", () => {
+    setOperationsVisibility(!state.operationsVisible);
+  });
+  $("#healthTabRow")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-health-tab]");
+    if (!button) return;
+    setHealthTab(button.dataset.healthTab || "strategy");
+  });
+  $("#advancedTabRow")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-advanced-tab]");
+    if (!button) return;
+    setAdvancedTab(button.dataset.advancedTab || "findings");
+  });
+  $("#openToolCatalogBtn")?.addEventListener("click", openToolCatalogWorkspace);
+  $("#activePhaseBar")?.addEventListener("change", (event) => {
+    const sortSelect = event.target.closest?.("#mainToolSortSelect");
+    if (!sortSelect) return;
+    state.toolSortMode = sortSelect.value || "usage";
     renderModules();
   });
-  $("#insightTabs").addEventListener("click", (event) => {
+  $("#insightTabs")?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-insight-tab]");
     if (!button) return;
     state.insightTab = button.dataset.insightTab || "console";
     renderInsightTabs();
   });
-  $("#detailViewBtn").addEventListener("click", () => {
-    setViewMode("detail");
-    renderModules();
-    renderInsightTabs();
-  });
-  $("#refreshJobsBtn").addEventListener("click", async () => {
-    await loadJobs();
-    if (state.activeJobId) await loadJob(state.activeJobId);
-  });
-  $("#stopAllJobsBtn").addEventListener("click", stopAllJobs);
-  $("#clearJobsBtn").addEventListener("click", clearJobs);
-  $("#viewHtmlBtn").addEventListener("click", viewHtmlReport);
-  $("#targetInput").addEventListener("input", () => {
+  $("#stopAllJobsBtn")?.addEventListener("click", stopAllJobs);
+  $("#clearJobsBtn")?.addEventListener("click", clearJobs);
+  $("#viewHtmlBtn")?.addEventListener("click", viewHtmlReport);
+  $("#viewJobEvidenceBtn")?.addEventListener("click", viewJobEvidence);
+  $("#viewJobMarkdownBtn")?.addEventListener("click", viewJobMarkdown);
+  $("#targetInput")?.addEventListener("input", () => {
     persistLastTarget($("#targetInput").value);
-    renderModules();
+    state.moduleDryRunCache = {};
+    state.expandedModuleCommandIds = [];
+    scheduleModulesRender();
+    const modal = $("#toolInspectModal");
+    if (modal && !modal.classList.contains("hidden") && state.selectedToolLabel) {
+      const entry = activeToolEntry();
+      openToolInspectModal(entry?.label || state.selectedToolLabel, entry?.status || null);
+    }
+    if (state.referencePanelLoaded) {
+      debouncedLoadTargetAsset();
+    }
   });
-  $("#moduleSearchInput").addEventListener("input", (event) => {
-    state.moduleSearchQuery = event.target.value || "";
-    renderModules();
+  $("#targetKindSelect")?.addEventListener("change", () => {
+    state.moduleDryRunCache = {};
+    state.expandedModuleCommandIds = [];
+    scheduleModulesRender();
+    const modal = $("#toolInspectModal");
+    if (modal && !modal.classList.contains("hidden") && state.selectedToolLabel) {
+      const entry = activeToolEntry();
+      openToolInspectModal(entry?.label || state.selectedToolLabel, entry?.status || null);
+    }
+    if (state.referencePanelLoaded) {
+      loadTargetAsset();
+    }
   });
-  $("#moduleProfileSelect").addEventListener("change", (event) => {
+  $("#moduleSearchInput")?.addEventListener("input", (event) => {
+    if (state.catalogSurface === "tools") {
+      state.toolSearchQuery = event.target.value || "";
+    } else {
+      state.moduleSearchQuery = event.target.value || "";
+    }
+    debouncedModuleSearchRender();
+  });
+  $("#moduleProfileSelect")?.addEventListener("change", (event) => {
     setModuleExecutionProfile(event.target.value || "fast");
-    renderModules();
+    state.moduleDryRunCache = {};
+    state.expandedModuleCommandIds = [];
+    renderChainPresetList();
+    scheduleModulesRender();
   });
 
-  $("#themeToggle").addEventListener("click", () => {
+  $("#themeToggle")?.addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
     document.documentElement.dataset.theme = next;
     localStorage.setItem("lab-console-theme", next);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeToolInspectModal();
+    }
   });
 }
 
@@ -1902,25 +4796,106 @@ function initTheme() {
 }
 
 function initViewMode() {
-  setViewMode(localStorage.getItem("lab-console-view-mode") || "playbook");
+  setViewMode("detail");
+}
+
+function initOperationsTab() {
+  setOperationsTab(localStorage.getItem("lab-console-operations-tab") || "workspace");
+  setOperationsVisibility(false);
+}
+
+function initHealthTab() {
+  setHealthTab(localStorage.getItem("lab-console-health-tab") || "strategy");
+}
+
+function initAdvancedTab() {
+  setAdvancedTab("findings");
+}
+
+const debouncedLoadTargetAsset = debounce(() => {
+  loadTargetAsset();
+}, 220);
+
+const debouncedModuleSearchRender = debounce(() => {
+  scheduleModulesRender();
+}, 120);
+
+const debouncedToolingHealthRender = debounce(() => {
+  renderToolingHealth();
+}, 120);
+
+async function ensureOperatorWorkspaceDataLoaded() {
+  if (state.operatorWorkspaceLoaded) return;
+  state.operatorWorkspaceLoaded = true;
+  const results = await Promise.allSettled([
+    loadAssessments(),
+    apiOptional("/api/approvals/dashboard", { counts: {}, approvals: [], pending: [] })
+  ]);
+  const approvalsResult = results[1];
+  if (approvalsResult?.status === "fulfilled") {
+    state.approvalsDashboard = approvalsResult.value || { counts: {}, approvals: [], pending: [] };
+  }
+  renderAssessmentSummary();
+  renderApprovalQueue();
+  renderAssessmentExportButtons();
+  renderImportResult();
+}
+
+async function ensureToolCatalogDataLoaded() {
+  if (state.toolCatalogLoaded) return;
+  if (state.toolCatalogLoadPromise) return state.toolCatalogLoadPromise;
+  state.toolCatalogLoading = true;
+  scheduleModulesRender();
+  state.toolCatalogLoadPromise = Promise.allSettled([
+    loadChainPresets(),
+    loadToolingHealth()
+  ]).finally(() => {
+    state.toolCatalogLoaded = true;
+    state.toolCatalogLoading = false;
+    state.toolCatalogLoadPromise = null;
+    scheduleModulesRender();
+  });
+  return state.toolCatalogLoadPromise;
+}
+
+async function ensureReferencePanelDataLoaded() {
+  if (state.referencePanelLoaded) return;
+  state.referencePanelLoaded = true;
+  await Promise.allSettled([
+    loadReferenceData(),
+    loadTargetAsset()
+  ]);
 }
 
 async function init() {
   initTheme();
   initViewMode();
+  initOperationsTab();
+  initHealthTab();
+  initAdvancedTab();
   restoreLastTarget();
+  state.toolSortMode = selectedToolSortMode();
   setModuleExecutionProfile("fast");
   syncModuleProfileSelect();
   bindEvents();
   bindConsoleResizeHandle();
+  setRunChainUiState("idle");
+  if ($("#activePhaseBar")) {
+    $("#activePhaseBar").innerHTML = '<div class="empty-jobs">Memuat katalog modul...</div>';
+  }
+  if ($("#phaseGroups")) {
+    $("#phaseGroups").innerHTML = '<div class="empty-jobs">Memuat modul dan command preview...</div>';
+  }
   try {
-  await loadConfig();
-  await loadModules();
-  await loadJobs();
-  renderInsightTabs();
-  queueConsoleHeightSync();
+    await Promise.all([
+      loadConfig(),
+      loadModules(),
+      loadJobs()
+    ]);
+    renderInsightTabs();
+    queueConsoleHeightSync();
     if (state.activeJobId) {
-      await loadJob(state.activeJobId);
+      void loadJob(state.activeJobId);
     } else {
       renderConsole(null);
     }

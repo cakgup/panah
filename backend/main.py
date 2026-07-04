@@ -22,8 +22,11 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from urllib.parse import quote_plus, urlparse
 import uuid
 import codecs
+import hashlib
+import hmac
 from ftplib import FTP
 from datetime import datetime, timezone
 from html import escape
@@ -31,31 +34,40 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urljoin
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+try:
+    import pty
+    import select
+except ImportError:  # pragma: no cover - Windows local sync only
+    pty = None
+    select = None
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.assets import ASSETS, asset_map, serialize_asset
 from backend.catalog import MODULES, module_map, module_playbook
-from backend.lab_config import load_lab_config, save_lab_config
+from backend.lab_config import DEFAULT_CONFIG_PATH, load_lab_config, save_lab_config
 from backend.store import JobStore
 from backend.wahidin_check_headers import check_headers as wahidin_check_headers
 from backend.workflow import ENGAGEMENTS, FINDINGS, parse_import
 
 # ============ Base Configuration ============
 BASE_DIR = Path(__file__).resolve().parent.parent
-APP_DB = BASE_DIR / "backend" / "data" / "console.db"
+# Hindari nama file yang diawali device-reserved name Windows seperti "CON".
+APP_DB = BASE_DIR / "backend" / "data" / "console.sqlite3"
 LAB_CONFIG = load_lab_config()
 ALLOWED_SUBNET_STRINGS = tuple(LAB_CONFIG["allowed_subnets"])
 LAB_PROFILES = tuple(LAB_CONFIG["lab_profiles"])
 LAB_CONFIG_SOURCE = str(LAB_CONFIG["source"])
 LAB_CONFIG_PATH = str(LAB_CONFIG["path"])
 ALLOWED_SUBNETS = tuple(ipaddress.ip_network(cidr) for cidr in ALLOWED_SUBNET_STRINGS)
+LAB_CONFIG_MTIME: float | None = None
 
 # ============ Timeouts ============
 EXECUTION_MODE = "live-execution"
-DESTRUCTIVE_MODE = "enabled"
+DESTRUCTIVE_MODE = os.getenv("REDTEAM_CONSOLE_DESTRUCTIVE_MODE", "disabled")
 JOB_HEARTBEAT_TIMEOUT_SECONDS = 600
 COMMAND_TIMEOUT_SECONDS = 900
 
@@ -68,24 +80,203 @@ ACTIVE_PROCESSES: dict[str, subprocess.Popen[str]] = {}
 STOP_REQUESTS: set[str] = set()
 COMMAND_RESULT_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 PROCESS_LOCK = threading.Lock()
-RANGE_SAVE_PASSWORD = "cakgup"
+INTERACTIVE_SESSIONS: dict[str, dict[str, Any]] = {}
+INTERACTIVE_SESSION_LOCK = threading.Lock()
+RANGE_SAVE_PASSWORD = os.getenv("REDTEAM_CONSOLE_RANGE_PASSWORD", "")
+RANGE_SAVE_PASSWORD_HASH = os.getenv("REDTEAM_CONSOLE_RANGE_PASSWORD_HASH", "").strip().lower()
+DEFAULT_SUDO_PASSWORD = os.getenv("REDTEAM_CONSOLE_DEFAULT_SUDO_PASSWORD", "kali")
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))")
+INTERACTIVE_TOOL_LABELS = {
+    "metasploit",
+    "ssh",
+    "smbclient",
+    "rpcclient",
+    "mysql",
+    "psql",
+    "redis-cli",
+    "ftp",
+    "telnet",
+}
+CHAIN_PRESETS: dict[str, dict[str, Any]] = {
+    "full-chain-default": {
+        "id": "full-chain-default",
+        "label": "Full Chain Default",
+        "description": "Menjalankan seluruh modul yang diizinkan oleh risk mode assessment saat ini.",
+        "recommended_risk_mode": "safe",
+        "phase_ids": (),
+        "priority_module_ids": (),
+    },
+    "quick-safe": {
+        "id": "quick-safe",
+        "label": "Quick Safe",
+        "description": "Coverage cepat untuk service discovery, fingerprint, header, dan baseline TLS tanpa memperluas workflow terlalu jauh.",
+        "recommended_risk_mode": "safe",
+        "phase_ids": ("recon", "baseline"),
+        "priority_module_ids": (
+            "recon-service-scan",
+            "recon-host-discovery",
+            "baseline-web-fingerprint",
+            "web-security-header-audit",
+            "baseline-tls-dns-review",
+        ),
+    },
+    "deep-enum": {
+        "id": "deep-enum",
+        "label": "Deep Enumeration",
+        "description": "Memperluas enumerasi host, DNS, route, misconfiguration, dan observasi teknologi web secara komprehensif namun tetap non-destruktif.",
+        "recommended_risk_mode": "deep",
+        "phase_ids": ("recon", "baseline"),
+        "priority_module_ids": (
+            "recon-service-scan",
+            "recon-host-discovery",
+            "recon-dns-enumeration",
+            "recon-amass-expansion",
+            "baseline-web-fingerprint",
+            "baseline-content-discovery",
+            "baseline-nikto-review",
+            "baseline-gobuster-routes",
+            "baseline-tls-dns-review",
+            "web-security-header-audit",
+        ),
+    },
+    "validation-deep": {
+        "id": "validation-deep",
+        "label": "Validation Deep",
+        "description": "Mengutamakan validasi temuan dan hardening backlog lintas web, DNS, route, dan file exposure yang masih aman/non-destruktif.",
+        "recommended_risk_mode": "deep",
+        "phase_ids": ("recon", "baseline", "weapon", "delivery"),
+        "priority_module_ids": (
+            "recon-service-scan",
+            "baseline-web-fingerprint",
+            "web-security-header-audit",
+            "baseline-content-discovery",
+            "baseline-nikto-review",
+            "baseline-gobuster-routes",
+            "baseline-tls-dns-review",
+            "recon-dns-enumeration",
+            "recon-amass-expansion",
+        ),
+    },
+    "intrusive-validation": {
+        "id": "intrusive-validation",
+        "label": "Intrusive Validation",
+        "description": "Mode validasi aktif yang hanya boleh berjalan jika assessment dan approval sudah tersedia untuk modul berisiko intrusive.",
+        "recommended_risk_mode": "intrusive",
+        "phase_ids": (),
+        "priority_module_ids": (),
+    },
+}
 
 app = FastAPI(title="Red Team Automation Platform - Complete")
 app.mount("/static", StaticFiles(directory=BASE_DIR), name="static")
 
+PUBLIC_PATH_PREFIXES = (
+    "/static",
+    "/login",
+    "/favicon.ico",
+    "/api/health",
+)
+
+
+def _safe_next_path(next_path: str | None) -> str:
+    if not next_path or not next_path.startswith("/"):
+        return "/"
+    if next_path.startswith("//"):
+        return "/"
+    return next_path
+
+
+def _render_login_page(next_url: str = "/", error: str | None = None) -> HTMLResponse:
+    template = (BASE_DIR / "login.html").read_text(encoding="utf-8")
+    error_block = ""
+    if error:
+        error_block = f'<div class="login-alert">{escape(error)}</div>'
+    html = (
+        template
+        .replace("__NEXT_URL__", escape(_safe_next_path(next_url), quote=True))
+        .replace("__ERROR_BLOCK__", error_block)
+    )
+    return HTMLResponse(content=html)
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    request.state.current_user = request.cookies.get("redteam_console_user")
+    path = request.url.path
+    if any(path.startswith(prefix) for prefix in PUBLIC_PATH_PREFIXES):
+        return await call_next(request)
+
+    if request.state.current_user:
+        return await call_next(request)
+
+    destination = path
+    if request.url.query:
+        destination = f"{path}?{request.url.query}"
+    login_url = f"/login?next={quote_plus(destination)}"
+    if path.startswith("/api/"):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "detail": "Authentication required",
+                "login_url": login_url
+            }
+        )
+    return RedirectResponse(url=login_url, status_code=303)
+
 # ============ Data Models ============
 class JobRequest(BaseModel):
     target: str = Field(..., examples=["10.10.10.20"])
+    target_kind: str = Field(default="ip")
     note: str = Field(default="", max_length=160)
     execution_profile: str = Field(default="balanced")
+
+class AssessmentCreateRequest(BaseModel):
+    target: str = Field(..., examples=["10.10.10.20"])
+    target_kind: str = Field(default="ip")
+    assessment_type: str = Field(default="internal")
+    risk_mode: str = Field(default="safe")
+    chain_preset: str = Field(default="full-chain-default")
+    operator_name: str = Field(default="operator")
+    ticket_ref: str = Field(default="")
+    note: str = Field(default="", max_length=240)
+
+class AssessmentApprovalRequest(BaseModel):
+    module_id: str
+    approved_by: str = Field(default="operator")
+    ticket_ref: str = Field(default="")
+    reason: str = Field(default="Approval granted for intrusive validation")
+    expires_at: str = Field(default="")
+
+class ChainApprovalRequest(BaseModel):
+    approved_by: str = Field(default="operator")
+    ticket_ref: str = Field(default="")
+    reason: str = Field(default="Bulk approval granted for intrusive validation chain")
+    risk_mode: str = Field(default="intrusive")
+    chain_preset: str = Field(default="full-chain-default")
+    expires_at: str = Field(default="")
+
+class FindingStatusRequest(BaseModel):
+    status: str = Field(default="open")
+    note: str = Field(default="", max_length=240)
+    owner: str = Field(default="", max_length=120)
+    due_date: str = Field(default="")
+    sla: str = Field(default="", max_length=80)
 
 class ModuleJobRequest(JobRequest):
     module_id: str
     execution_profile: str = Field(default="balanced")
+    assessment_id: str = Field(default="")
+    risk_mode: str = Field(default="safe")
+
+class ChainJobRequest(JobRequest):
+    assessment_id: str = Field(default="")
+    risk_mode: str = Field(default="safe")
+    chain_preset: str = Field(default="full-chain-default")
 
 class ImportRequest(BaseModel):
     tool_name: str = Field(default="generic")
     target: str = Field(..., examples=["10.10.10.20"])
+    target_kind: str = Field(default="ip")
     content: str = Field(default="")
 
 class ConfigUpdateRequest(BaseModel):
@@ -94,7 +285,7 @@ class ConfigUpdateRequest(BaseModel):
 
 
 def apply_lab_config(config: dict[str, Any]) -> None:
-    global LAB_CONFIG, ALLOWED_SUBNET_STRINGS, LAB_PROFILES, LAB_CONFIG_SOURCE, LAB_CONFIG_PATH, ALLOWED_SUBNETS
+    global LAB_CONFIG, ALLOWED_SUBNET_STRINGS, LAB_PROFILES, LAB_CONFIG_SOURCE, LAB_CONFIG_PATH, ALLOWED_SUBNETS, LAB_CONFIG_MTIME
     subnet_strings = tuple(str(item).strip() for item in config["allowed_subnets"])
     subnet_networks: list[ipaddress._BaseNetwork] = []
     for cidr in subnet_strings:
@@ -109,17 +300,53 @@ def apply_lab_config(config: dict[str, Any]) -> None:
     LAB_CONFIG_SOURCE = str(config["source"])
     LAB_CONFIG_PATH = str(config["path"])
     ALLOWED_SUBNETS = tuple(subnet_networks)
+    try:
+        LAB_CONFIG_MTIME = Path(LAB_CONFIG_PATH).stat().st_mtime
+    except OSError:
+        LAB_CONFIG_MTIME = None
+
+
+def sync_lab_config_from_disk(force: bool = False) -> None:
+    config_path = Path(LAB_CONFIG_PATH or DEFAULT_CONFIG_PATH)
+    try:
+        current_mtime = config_path.stat().st_mtime
+    except OSError:
+        current_mtime = None
+
+    if force or current_mtime != LAB_CONFIG_MTIME:
+        apply_lab_config(load_lab_config())
+
+class DestructiveApprovalRequest(BaseModel):
+    action: str
+    approved_by: str = Field(default="operator")
+    ticket_ref: str = Field(default="")
+    reason: str = Field(default="Approval granted for destructive action")
+    expires_at: str = Field(default="")
 
 class DestructiveActionRequest(BaseModel):
     action: str
     target: str
-    approved: bool = True
-    approved_by: str = "system"
+    assessment_id: str
+    confirmation_token: str
 
 class ExploitRequest(BaseModel):
     target: str
     exploit_type: str
     params: dict[str, Any] = Field(default_factory=dict)
+
+class ToolCommandExecuteRequest(BaseModel):
+    tool_name: str
+    command: str
+    sudo_password: str = Field(default="", max_length=256)
+    timeout: int = Field(default=120, ge=5, le=300)
+
+class InteractiveToolSessionOpenRequest(BaseModel):
+    tool_name: str
+    command: str
+    sudo_password: str = Field(default="", max_length=256)
+
+class InteractiveToolSessionInputRequest(BaseModel):
+    command: str = Field(default="", max_length=1000)
 
 # ============ Extended Tool Definitions ============
 TOOL_COMMAND_ALIASES: dict[str, list[str] | None] = {
@@ -250,19 +477,75 @@ def parse_iso_timestamp(value: str | None) -> datetime | None:
     except ValueError:
         return None
 
-def validate_target(target: str) -> str:
+def normalize_target_kind(value: str | None) -> str:
+    kind = str(value or "ip").strip().lower()
+    if kind not in {"ip", "cidr", "domain", "hostname", "url"}:
+        return "ip"
+    return kind
+
+
+def validate_ip_against_allowed_subnets(value: str) -> str:
+    sync_lab_config_from_disk()
     try:
-        address = ipaddress.ip_address(target)
+        address = ipaddress.ip_address(value)
     except ValueError as error:
         raise HTTPException(status_code=400, detail="Target harus berupa IPv4/IPv6 yang valid.") from error
-
     if not any(address in subnet for subnet in ALLOWED_SUBNETS):
         allowed_text = ", ".join(str(subnet) for subnet in ALLOWED_SUBNETS)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Target di luar subnet lab yang diizinkan. Gunakan alamat dalam: {allowed_text}.",
-        )
+        raise HTTPException(status_code=400, detail=f"Target di luar subnet lab yang diizinkan. Gunakan alamat dalam: {allowed_text}.")
     return str(address)
+
+
+def validate_cidr_against_allowed_subnets(value: str) -> str:
+    sync_lab_config_from_disk()
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Target CIDR tidak valid.") from error
+    if not all(any(candidate.subnet_of(allowed) for allowed in ALLOWED_SUBNETS) for candidate in [network]):
+        allowed_text = ", ".join(str(subnet) for subnet in ALLOWED_SUBNETS)
+        raise HTTPException(status_code=400, detail=f"CIDR target di luar subnet lab yang diizinkan. Gunakan scope dalam: {allowed_text}.")
+    return str(network)
+
+
+def validate_host_label(value: str, *, detail: str) -> str:
+    candidate = str(value or "").strip().lower().rstrip('.')
+    if not candidate:
+        raise HTTPException(status_code=400, detail=detail)
+    if len(candidate) > 253:
+        raise HTTPException(status_code=400, detail=detail)
+    labels = candidate.split('.')
+    if any(not label or len(label) > 63 for label in labels):
+        raise HTTPException(status_code=400, detail=detail)
+    for label in labels:
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label):
+            raise HTTPException(status_code=400, detail=detail)
+    return candidate
+
+
+def validate_url_target(value: str) -> str:
+    raw = str(value or "").strip()
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Target URL harus berupa http/https yang valid.")
+    hostname = parsed.hostname or ""
+    validate_host_label(hostname, detail="Hostname pada target URL tidak valid.")
+    return raw
+
+
+def validate_target(target: str, target_kind: str = "ip") -> str:
+    kind = normalize_target_kind(target_kind)
+    if kind == "ip":
+        return validate_ip_against_allowed_subnets(target)
+    if kind == "cidr":
+        return validate_cidr_against_allowed_subnets(target)
+    if kind == "domain":
+        return validate_host_label(target, detail="Target domain tidak valid.")
+    if kind == "hostname":
+        return validate_host_label(target, detail="Target hostname tidak valid.")
+    if kind == "url":
+        return validate_url_target(target)
+    return validate_ip_against_allowed_subnets(target)
 
 def tool_status(label: str) -> dict[str, Any]:
     commands = TOOL_COMMAND_ALIASES.get(label, [label])
@@ -276,6 +559,215 @@ def tool_status(label: str) -> dict[str, Any]:
 def check_tool_availability(tool_name: str) -> bool:
     status = tool_status(tool_name)
     return status.get("installed", False) is True
+
+def allowed_tool_commands(tool_name: str) -> set[str]:
+    aliases = TOOL_COMMAND_ALIASES.get(tool_name)
+    if not aliases:
+        return set()
+    return {str(alias).strip() for alias in aliases if str(alias).strip()}
+
+def validate_literal_targets_in_command(command: str) -> None:
+    for candidate in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b", command):
+        if "/" in candidate:
+            validate_cidr_against_allowed_subnets(candidate)
+        else:
+            validate_ip_against_allowed_subnets(candidate)
+
+def validate_tool_command_request(tool_name: str, command: str) -> str:
+    normalized_tool = str(tool_name or "").strip().lower()
+    if normalized_tool not in TOOL_COMMAND_ALIASES:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    status = tool_status(normalized_tool)
+    if status.get("kind") == "conceptual":
+        raise HTTPException(status_code=400, detail="Tool conceptual tidak bisa dieksekusi langsung.")
+    if status.get("installed") is not True:
+        raise HTTPException(status_code=400, detail="Tool belum tersedia di environment.")
+
+    raw_command = str(command or "").strip()
+    if not raw_command:
+        raise HTTPException(status_code=400, detail="Command tidak boleh kosong.")
+    if len(raw_command) > 600:
+        raise HTTPException(status_code=400, detail="Command terlalu panjang untuk quick execute.")
+    if any(token in raw_command for token in ("\n", "\r", "&&", "||", ";", "`", "$(", ">", "<")):
+        raise HTTPException(status_code=400, detail="Shell chaining, redirect, atau subshell tidak didukung di quick execute.")
+
+    try:
+        parts = shlex.split(raw_command, posix=True)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=f"Command tidak valid: {error}") from error
+
+    if not parts:
+        raise HTTPException(status_code=400, detail="Command tidak boleh kosong.")
+
+    base_command = parts[0]
+    effective_base_command = parts[1] if base_command == "sudo" and len(parts) > 1 else base_command
+    if base_command == "sudo" and len(parts) == 1:
+        raise HTTPException(status_code=400, detail="Command sudo tidak lengkap.")
+    if base_command == "sudo" and any(part in {"-i", "--login", "-s"} for part in parts[1:3]):
+        raise HTTPException(status_code=400, detail="Mode sudo interaktif tidak didukung di quick execute.")
+    if effective_base_command not in allowed_tool_commands(normalized_tool):
+        raise HTTPException(status_code=400, detail=f"Command harus diawali alias resmi untuk tool {normalized_tool}.")
+
+    validate_literal_targets_in_command(raw_command)
+    return raw_command
+
+def command_requires_sudo_password(command: str) -> bool:
+    try:
+        parts = shlex.split(str(command or "").strip(), posix=True)
+    except ValueError:
+        return False
+    return bool(parts and parts[0] == "sudo")
+
+def wrap_command_with_sudo_password(command: str) -> str:
+    try:
+        parts = shlex.split(str(command or "").strip(), posix=True)
+    except ValueError:
+        return str(command or "").strip()
+    if not parts:
+        return str(command or "").strip()
+    if parts[0] != "sudo":
+        parts = ["sudo", *parts]
+    if "-S" not in parts:
+        parts.insert(1, "-S")
+    if "-p" not in parts:
+        parts[2:2] = ["-p", ""]
+    return shlex.join(parts)
+
+def stderr_indicates_sudo_password(stderr: str) -> bool:
+    text = str(stderr or "").lower()
+    return "sudo:" in text and ("password is required" in text or "terminal is required" in text)
+
+def effective_base_command_from_parts(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    if parts[0] != "sudo":
+        return parts[0]
+    index = 1
+    options_with_value = {"-p", "-u", "-g", "-h", "-C"}
+    while index < len(parts):
+        token = parts[index]
+        if token in options_with_value:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return "sudo"
+
+def is_interactive_tool(label: str, command: str = "") -> bool:
+    normalized_label = str(label or "").strip().lower()
+    if normalized_label in INTERACTIVE_TOOL_LABELS:
+        return True
+    try:
+        parts = shlex.split(str(command or "").strip(), posix=True)
+    except ValueError:
+        return False
+    base = effective_base_command_from_parts(parts)
+    return base in {"msfconsole", "ssh", "smbclient", "rpcclient", "mysql", "psql", "redis-cli", "ftp", "telnet"}
+
+def sanitize_terminal_output(chunk: str) -> str:
+    if not chunk:
+        return ""
+    cleaned = ANSI_ESCAPE_RE.sub("", str(chunk))
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "")
+    cleaned = cleaned.replace("\x08", "")
+    cleaned = cleaned.replace("\x00", "")
+    return cleaned
+
+def append_interactive_output(session: dict[str, Any], chunk: str) -> None:
+    if not chunk:
+        return
+    combined = f"{session.get('output', '')}{sanitize_terminal_output(chunk)}"
+    if len(combined) > 120000:
+        combined = combined[-120000:]
+    session["output"] = combined
+    session["updated_at"] = now_iso()
+
+def serialize_interactive_session(session: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": session["id"],
+        "tool_name": session["tool_name"],
+        "command": session["command"],
+        "started_command": session.get("started_command", session["command"]),
+        "status": session.get("status", "running"),
+        "created_at": session.get("created_at"),
+        "updated_at": session.get("updated_at"),
+        "exit_code": session.get("exit_code"),
+        "output": session.get("output", "")[-12000:],
+        "interactive": True,
+    }
+
+def interactive_session_reader(session_id: str) -> None:
+    if select is None:
+        return
+    while True:
+        with INTERACTIVE_SESSION_LOCK:
+            session = INTERACTIVE_SESSIONS.get(session_id)
+        if not session:
+            return
+        process = session.get("process")
+        master_fd = session.get("master_fd")
+        if process is None or master_fd is None:
+            return
+        try:
+            ready, _, _ = select.select([master_fd], [], [], 0.25)
+            if ready:
+                data = os.read(master_fd, 4096)
+                if data:
+                    with INTERACTIVE_SESSION_LOCK:
+                        live_session = INTERACTIVE_SESSIONS.get(session_id)
+                        if live_session:
+                            append_interactive_output(live_session, data.decode("utf-8", "replace"))
+                else:
+                    break
+        except OSError:
+            break
+        if process.poll() is not None:
+            break
+
+    with INTERACTIVE_SESSION_LOCK:
+        session = INTERACTIVE_SESSIONS.get(session_id)
+        if session:
+            process = session.get("process")
+            session["status"] = "stopped"
+            session["exit_code"] = process.poll() if process else None
+            session["updated_at"] = now_iso()
+            master_fd = session.get("master_fd")
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+                session["master_fd"] = None
+
+def close_interactive_session_internal(session_id: str) -> dict[str, Any] | None:
+    with INTERACTIVE_SESSION_LOCK:
+        session = INTERACTIVE_SESSIONS.get(session_id)
+        if not session:
+            return None
+        process = session.get("process")
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        master_fd = session.get("master_fd")
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            session["master_fd"] = None
+        session["status"] = "closed"
+        session["exit_code"] = process.poll() if process else None
+        session["updated_at"] = now_iso()
+        return serialize_interactive_session(session)
 
 def first_existing_path(candidates: list[str], fallback: str) -> str:
     for candidate in candidates:
@@ -323,6 +815,872 @@ def normalize_execution_profile(value: str | None, *, force_fast: bool = False) 
     if profile not in {"fast", "balanced", "deep"}:
         return "balanced"
     return profile
+
+
+def normalize_risk_mode(value: str | None) -> str:
+    risk_mode = str(value or "safe").strip().lower()
+    if risk_mode not in {"safe", "deep", "intrusive"}:
+        return "safe"
+    return risk_mode
+
+
+def normalize_chain_preset(value: str | None) -> str:
+    preset_id = str(value or "full-chain-default").strip().lower()
+    return preset_id if preset_id in CHAIN_PRESETS else "full-chain-default"
+
+
+def chain_preset_definition(preset_id: str | None) -> dict[str, Any]:
+    return CHAIN_PRESETS[normalize_chain_preset(preset_id)]
+
+
+def module_allowed_in_risk_mode(module, risk_mode: str) -> bool:
+    normalized_mode = normalize_risk_mode(risk_mode)
+    if normalized_mode == "safe":
+        return bool(module.safe_in_chain) and module.risk_class == "safe"
+    if normalized_mode == "deep":
+        return bool(module.deep_in_chain) and module.risk_class in {"safe", "deep"}
+    return module.risk_class in {"safe", "deep", "intrusive"}
+
+
+def select_chain_modules(risk_mode: str, chain_preset: str = "full-chain-default") -> list[str]:
+    normalized_mode = normalize_risk_mode(risk_mode)
+    preset = chain_preset_definition(chain_preset)
+    phase_ids = {str(item) for item in preset.get("phase_ids", ()) if str(item)}
+    priority_module_ids = [str(item) for item in preset.get("priority_module_ids", ()) if str(item)]
+    priority_set = set(priority_module_ids)
+    selected: list[str] = []
+    deferred: list[str] = []
+    for module in MODULES:
+        if module.id == "read-sensitive-file":
+            continue
+        if not module_allowed_in_risk_mode(module, normalized_mode):
+            continue
+        if phase_ids and module.phase_id not in phase_ids and module.id not in priority_set:
+            continue
+        if module.id in priority_set:
+            deferred.append(module.id)
+        else:
+            selected.append(module.id)
+    ordered_priority = [module_id for module_id in priority_module_ids if module_id in deferred]
+    trailing = [module_id for module_id in deferred if module_id not in ordered_priority]
+    return ordered_priority + selected + trailing
+
+
+def module_run_index(job: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    runs = job.get("module_runs", []) if isinstance(job, dict) else []
+    return {str(run.get("module_id")): run for run in runs if isinstance(run, dict) and run.get("module_id")}
+
+
+def completed_module_ids(job: dict[str, Any]) -> set[str]:
+    completed: set[str] = set()
+    for module_id, run in module_run_index(job).items():
+        if str(run.get("status") or "") in {"completed", "failed", "stopped"}:
+            completed.add(module_id)
+    return completed
+
+
+def recommended_next_modules_for_job(job: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+    risk_mode = normalize_risk_mode(str(runtime_meta(job).get("risk_mode") or "safe"))
+    chain_preset = normalize_chain_preset(str(runtime_meta(job).get("chain_preset") or "full-chain-default"))
+    allowed = select_chain_modules(risk_mode, chain_preset)
+    completed = completed_module_ids(job)
+    recommendations: list[dict[str, Any]] = []
+    for module_id in allowed:
+        if module_id in completed:
+            continue
+        module = MODULE_BY_ID[module_id]
+        recommendations.append(
+            {
+                "module_id": module.id,
+                "title": module.title,
+                "phase_label": module.phase_label,
+                "risk_class": module.risk_class,
+                "requires_approval": module.requires_approval,
+                "operator_focus": module_playbook(module).operator_focus,
+            }
+        )
+        if len(recommendations) >= limit:
+            break
+    return recommendations
+
+
+def assessment_jobs(assessment_id: str) -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    for job in JOB_STORE.list_jobs():
+        meta = runtime_meta(job)
+        if str(meta.get("assessment_id") or "") == assessment_id:
+            jobs.append(job)
+    jobs.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return jobs
+
+
+def assessment_recommendations(
+    assessment_id: str,
+    limit: int = 6,
+    *,
+    jobs: list[dict[str, Any]] | None = None,
+    findings: list[dict[str, Any]] | None = None,
+    correlation: dict[str, Any] | None = None,
+    pending_approvals: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    risk_mode = normalize_risk_mode(str(assessment.get("risk_mode") or "safe"))
+    chain_preset = normalize_chain_preset(str((assessment.get("metadata") or {}).get("chain_preset") or "full-chain-default"))
+    allowed = select_chain_modules(risk_mode, chain_preset)
+    jobs = jobs if jobs is not None else assessment_jobs(assessment_id)
+    seen_completed: set[str] = set()
+    for job in jobs:
+        seen_completed.update(completed_module_ids(job))
+    findings = findings if findings is not None else JOB_STORE.list_findings(assessment_id)
+    open_findings = [item for item in findings if str(item.get("status") or "open") == "open"]
+    pending_approvals = pending_approvals if pending_approvals is not None else assessment_pending_approval_modules(assessment_id)
+    pending_ids = {item.get("module_id") for item in pending_approvals}
+    modules_from_findings: list[str] = []
+    for finding in open_findings:
+        module_id = str(finding.get("module_id") or "")
+        if module_id and module_id in allowed and module_id not in seen_completed and module_id not in modules_from_findings:
+            modules_from_findings.append(module_id)
+    priorities = (correlation if correlation is not None else assessment_correlation(assessment_id)).get("priority_queue", [])
+    for item in priorities:
+        for module_id in item.get("module_ids", []):
+            if module_id in allowed and module_id not in seen_completed and module_id not in modules_from_findings:
+                modules_from_findings.append(module_id)
+    ordered_module_ids = modules_from_findings + [module_id for module_id in allowed if module_id not in seen_completed and module_id not in modules_from_findings]
+    recommendations: list[dict[str, Any]] = []
+    for module_id in ordered_module_ids:
+        module = MODULE_BY_ID[module_id]
+        reasons: list[str] = []
+        if module_id in pending_ids:
+            reasons.append("menunggu approval untuk membuka coverage modul sensitif")
+        if any(str(item.get("module_id") or "") == module_id for item in open_findings):
+            reasons.append("ada finding open dari modul terkait yang perlu validasi lanjutan")
+        recommendations.append({
+            "module_id": module.id,
+            "title": module.title,
+            "phase_label": module.phase_label,
+            "risk_class": module.risk_class,
+            "requires_approval": module.requires_approval,
+            "operator_focus": module_playbook(module).operator_focus,
+            "reason": "; ".join(reasons) if reasons else "melanjutkan coverage assessment yang belum selesai",
+        })
+        if len(recommendations) >= limit:
+            break
+    return {
+        "assessment_id": assessment_id,
+        "risk_mode": risk_mode,
+        "chain_preset": chain_preset,
+        "preset": chain_preset_definition(chain_preset),
+        "completed_modules": len(seen_completed),
+        "total_chain_modules": len(allowed),
+        "open_findings": len(open_findings),
+        "pending_approvals": len(pending_approvals),
+        "recommended_modules": recommendations,
+    }
+
+
+def assessment_workspace_path(assessment_id: str) -> str:
+    workspace = BASE_DIR / "backend" / "workspaces" / assessment_id
+    workspace.mkdir(parents=True, exist_ok=True)
+    for child in ("raw", "parsed", "reports", "logs", "exports"):
+        (workspace / child).mkdir(exist_ok=True)
+    return str(workspace)
+
+
+def assessment_workspace_dir(assessment: dict[str, Any]) -> Path:
+    metadata = assessment.get("metadata") if isinstance(assessment, dict) else {}
+    workspace_value = str((metadata or {}).get("workspace") or "").strip()
+    if workspace_value:
+        workspace = Path(workspace_value)
+    else:
+        workspace = Path(assessment_workspace_path(str(assessment.get("id") or "default")))
+    workspace.mkdir(parents=True, exist_ok=True)
+    for child in ("raw", "parsed", "reports", "logs", "exports"):
+        (workspace / child).mkdir(exist_ok=True)
+    return workspace
+
+
+def assessment_chain_preset(assessment: dict[str, Any] | None) -> str:
+    if not assessment:
+        return "full-chain-default"
+    metadata = assessment.get("metadata") if isinstance(assessment, dict) else {}
+    return normalize_chain_preset((metadata or {}).get("chain_preset"))
+
+
+def deduplicate_evidence_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    index_by_fingerprint: dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        normalized = {
+            **item,
+            "details": unique_text_lines([str(entry) for entry in item.get("details", [])], limit=40),
+            "artifacts": deduplicate_artifacts(item.get("artifacts", {})),
+        }
+        fingerprint = evidence_fingerprint(normalized)
+        existing_index = index_by_fingerprint.get(fingerprint)
+        if existing_index is None:
+            index_by_fingerprint[fingerprint] = len(merged)
+            merged.append(normalized)
+            continue
+        existing = merged[existing_index]
+        merged[existing_index] = {
+            **existing,
+            **normalized,
+            "severity": severity_max(str(existing.get("severity") or "info"), str(normalized.get("severity") or "info")),
+            "details": unique_text_lines([*existing.get("details", []), *normalized.get("details", [])], limit=40),
+            "artifacts": deduplicate_artifacts({**existing.get("artifacts", {}), **normalized.get("artifacts", {})}),
+        }
+    return merged
+
+
+def severity_summary_for_evidence(evidence: list[dict[str, Any]]) -> dict[str, int]:
+    summary = blank_severity_summary()
+    for item in evidence:
+        severity = str(item.get("severity") or "info").lower()
+        if severity not in summary:
+            severity = "info"
+        summary[severity] += 1
+    return summary
+
+
+def assessment_jobs_resolved(assessment_id: str) -> list[dict[str, Any]]:
+    resolved: list[dict[str, Any]] = []
+    for job in assessment_jobs(assessment_id):
+        resolved.append(reconcile_job_state(job) or job)
+    return resolved
+
+
+def assessment_composite_job(assessment_id: str) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    jobs = assessment_jobs_resolved(assessment_id)
+    evidence = deduplicate_evidence_items([item for job in jobs for item in job.get("evidence", []) if isinstance(item, dict)])
+    module_runs = [run for job in jobs for run in job.get("module_runs", []) if isinstance(run, dict)]
+    logs = [make_log(f"Assessment {assessment_id} aggregated from {len(jobs)} jobs.")]
+    for job in jobs[:25]:
+        logs.append(make_log(f"{job.get('scope_label', 'Job')} - {job.get('status', 'unknown')} - {job.get('progress', 0)}%"))
+    return {
+        "id": assessment_id,
+        "scope_type": "assessment",
+        "scope_label": f"Assessment {assessment.get('target')}",
+        "target": assessment.get("target"),
+        "note": assessment.get("note", ""),
+        "status": assessment.get("status", "ready"),
+        "progress": max([int(job.get("progress") or 0) for job in jobs], default=0),
+        "created_at": assessment.get("created_at"),
+        "updated_at": assessment.get("updated_at"),
+        "module_ids": [run.get("module_id") for run in module_runs if run.get("module_id")],
+        "logs": logs,
+        "severity_summary": severity_summary_for_evidence(evidence),
+        "evidence": evidence,
+        "module_runs": module_runs,
+        "runtime_meta": {
+            "assessment_id": assessment_id,
+            "risk_mode": normalize_risk_mode(str(assessment.get("risk_mode") or "safe")),
+            "chain_preset": assessment_chain_preset(assessment),
+        },
+    }
+
+
+def assessment_pending_approval_modules(assessment_id: str) -> list[dict[str, Any]]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    return []
+
+def bulk_approvable_modules(assessment_id: str, risk_mode: str, chain_preset: str) -> list[Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    return []
+
+
+def finding_rulepack_profile(item: dict[str, Any], finding: dict[str, Any]) -> dict[str, Any]:
+    artifacts = item.get("artifacts") or {}
+    title = str(finding.get("title") or "Finding")
+    description = list(finding.get("description") or [])
+    recommendations = list(finding.get("recommendations") or [])
+    rule_id = "generic-evidence"
+    if artifacts.get("web_ports") and artifacts.get("http_headers"):
+        title = f"Eksposur fingerprint dan metadata web pada {', '.join([str(p) for p in artifacts.get('web_ports', [])][:3])}"
+        description = ["Header atau fingerprint teknologi web terekspos dan dapat mempercepat enumerasi service.", *description]
+        recommendations = ["Minimalkan banner leakage, header berlebih, dan fingerprint teknologi pada permukaan web.", *recommendations]
+        rule_id = "web-metadata-exposure"
+    elif artifacts.get("paths") or artifacts.get("indexed_paths"):
+        title = "Paparan route atau path aplikasi memperluas permukaan enumerasi"
+        description = ["Path discovery menunjukkan route yang dapat diprioritaskan untuk validasi hardening dan auth boundary.", *description]
+        recommendations = ["Tinjau route sensitif, kebijakan auth, dan nonaktifkan exposure yang tidak dibutuhkan.", *recommendations]
+        rule_id = "route-surface-exposure"
+    elif artifacts.get("exposed_files") or artifacts.get("download_url"):
+        title = "Paparan file sensitif atau URL unduhan teridentifikasi"
+        description = ["Evidence menunjukkan artefak file atau URL yang dapat mengarah ke disclosure konfigurasi atau data.", *description]
+        recommendations = ["Batasi akses file sensitif, audit direct download, dan terapkan kontrol akses yang konsisten.", *recommendations]
+        rule_id = "sensitive-file-exposure"
+    elif artifacts.get("dns_records") or artifacts.get("subdomains"):
+        title = "Ekspansi DNS dan virtual host menambah permukaan target"
+        description = ["Data DNS/subdomain menunjukkan perluasan permukaan yang perlu dikorelasikan dengan baseline exposure.", *description]
+        recommendations = ["Validasi kepemilikan subdomain, hygiene DNS, dan hardening vhost yang masih aktif.", *recommendations]
+        rule_id = "dns-surface-expansion"
+    elif artifacts.get("open_ports"):
+        title = "Permukaan port/service terbuka memerlukan validasi hardening"
+        description = ["Service terbuka yang terobservasi perlu divalidasi terhadap kebutuhan operasional dan baseline exposure.", *description]
+        recommendations = ["Review kebutuhan service, segmentasi, dan pembatasan akses service yang tidak esensial.", *recommendations]
+        rule_id = "service-exposure"
+    return {
+        "title": clean_scanner_text(title),
+        "description": clean_scanner_lines(description, limit=12),
+        "recommendations": clean_scanner_lines(recommendations, limit=8),
+        "rule_id": rule_id,
+    }
+
+
+def assessment_findings_records(assessment_id: str) -> list[dict[str, Any]]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    composite = assessment_composite_job(assessment_id)
+    findings = collect_findings(composite)
+    created_at = str(assessment.get("created_at") or now_iso())
+    updated_at = now_iso()
+    previous_by_source = {item.get("source_key"): item for item in JOB_STORE.list_findings(assessment_id)}
+    records: list[dict[str, Any]] = []
+    item_lookup = {}
+    for item in composite.get("evidence", []):
+        key = f"{str(item.get('module_id') or '')}|{severity_label_id(str(item.get('severity', 'info')))}|{clean_scanner_text(finding_profile(item)['title'])}"
+        item_lookup[key] = item
+    for finding in findings:
+        source_item = item_lookup.get(f"{finding.get('module_id', '')}|{finding.get('severity', '')}|{finding.get('title', '')}", {})
+        compare_key = hashlib.sha256(
+            f"{assessment.get('target', '')}|{assessment.get('target_kind', 'ip')}|{finding.get('module_id', '')}|{finding.get('title', '')}".encode()
+        ).hexdigest()
+        source_key = hashlib.sha256(
+            f"{assessment_id}|{finding.get('module_id', '')}|{finding.get('severity', '')}|{finding.get('title', '')}".encode()
+        ).hexdigest()
+        previous = previous_by_source.get(source_key) or {}
+        previous_metadata = previous.get("metadata") if isinstance(previous, dict) else {}
+        rulepack = finding_rulepack_profile(source_item if isinstance(source_item, dict) else {}, finding)
+        records.append({
+            "id": str(previous.get("id") or f"finding-{source_key[:16]}"),
+            "assessment_id": assessment_id,
+            "source_key": source_key,
+            "target": str(assessment.get("target") or ""),
+            "title": str(rulepack.get("title") or finding.get("title") or "Finding"),
+            "severity": str(finding.get("severity") or "INFO"),
+            "status": str(previous.get("status") or "open"),
+            "module_id": str(finding.get("module_id") or ""),
+            "module_title": str(finding.get("module_title") or ""),
+            "phase_label": str(finding.get("phase_label") or ""),
+            "description": rulepack.get("description") or finding.get("description") or [],
+            "impact": finding.get("impact") or [],
+            "recommendations": rulepack.get("recommendations") or finding.get("recommendations") or [],
+            "evidence_lines": finding.get("evidence_lines") or [],
+            "artifacts": finding.get("artifacts") or {},
+            "job_refs": list({run.get("job_id") for run in composite.get("module_runs", []) if run.get("job_id") and run.get("module_id") == finding.get("module_id")}),
+            "created_at": str(previous.get("created_at") or created_at),
+            "updated_at": updated_at,
+            "metadata": {
+                **(previous_metadata if isinstance(previous_metadata, dict) else {}),
+                "execution_profile": finding.get("execution_profile", "-"),
+                "number": finding.get("number", 0),
+                "compare_key": compare_key,
+                "rule_id": rulepack.get("rule_id", "generic-evidence"),
+            },
+        })
+    return records
+
+
+def sync_assessment_findings(assessment_id: str) -> list[dict[str, Any]]:
+    records = assessment_findings_records(assessment_id)
+    JOB_STORE.replace_assessment_findings(assessment_id, records)
+    return JOB_STORE.list_findings(assessment_id)
+
+
+def assessment_findings_summary(assessment_id: str) -> dict[str, Any]:
+    findings = JOB_STORE.list_findings(assessment_id)
+    severity_summary = {"KRITIS": 0, "TINGGI": 0, "SEDANG": 0, "RENDAH": 0, "INFO": 0}
+    status_summary: dict[str, int] = {}
+    for finding in findings:
+        severity = str(finding.get("severity") or "INFO").upper()
+        severity_summary[severity] = severity_summary.get(severity, 0) + 1
+        status = str(finding.get("status") or "open").lower()
+        status_summary[status] = status_summary.get(status, 0) + 1
+    return {
+        "assessment_id": assessment_id,
+        "total": len(findings),
+        "severity_summary": severity_summary,
+        "status_summary": status_summary,
+        "top_findings": findings[:5],
+    }
+
+
+def assessment_exposure_drift(assessment_id: str, *, correlation: dict[str, Any] | None = None) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    current = correlation if correlation is not None else assessment_correlation(assessment_id)
+    candidates = [item for item in JOB_STORE.list_assessments() if str(item.get("id")) != assessment_id and str(item.get("target")) == str(assessment.get("target")) and normalize_target_kind(str(item.get("target_kind") or "ip")) == normalize_target_kind(str(assessment.get("target_kind") or "ip"))]
+    baseline = candidates[0] if candidates else None
+    categories = ["open_ports", "web_ports", "paths", "subdomains", "dns_records", "exposed_files", "download_urls"]
+    current_signals = current.get("signals", {})
+    if not baseline:
+        return {"assessment_id": assessment_id, "baseline_assessment_id": None, "new_signals": current_signals, "resolved_signals": {key: [] for key in categories}, "summary": {key: {"new": len(current_signals.get(key, [])), "resolved": 0} for key in categories}}
+    baseline_signals = assessment_correlation(str(baseline.get("id"))).get("signals", {})
+    new_signals = {}
+    resolved_signals = {}
+    summary = {}
+    for key in categories:
+        current_values = [str(item) for item in current_signals.get(key, [])]
+        baseline_values = [str(item) for item in baseline_signals.get(key, [])]
+        new_signals[key] = [item for item in current_values if item not in baseline_values]
+        resolved_signals[key] = [item for item in baseline_values if item not in current_values]
+        summary[key] = {"new": len(new_signals[key]), "resolved": len(resolved_signals[key])}
+    return {"assessment_id": assessment_id, "baseline_assessment_id": str(baseline.get("id")), "new_signals": new_signals, "resolved_signals": resolved_signals, "summary": summary}
+
+
+def approvals_dashboard() -> dict[str, Any]:
+    # Approval flow dinonaktifkan untuk operasi assessment reguler agar UX lebih cepat
+    # dan summary tidak membingungkan operator.
+    return {
+        "counts": {"active": 0, "expired": 0, "destructive": 0},
+        "approvals": [],
+        "pending": [],
+    }
+
+
+def assessment_findings_diff(assessment_id: str, *, findings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    current = findings if findings is not None else JOB_STORE.list_findings(assessment_id)
+    candidates = [item for item in JOB_STORE.list_assessments() if str(item.get("id")) != assessment_id and str(item.get("target")) == str(assessment.get("target")) and normalize_target_kind(str(item.get("target_kind") or "ip")) == normalize_target_kind(str(assessment.get("target_kind") or "ip"))]
+    baseline = candidates[0] if candidates else None
+    if not baseline:
+        return {"assessment_id": assessment_id, "baseline_assessment_id": None, "new": [], "recurring": current, "resolved": []}
+    baseline_findings = JOB_STORE.list_findings(str(baseline.get("id")))
+    current_map = {str((item.get("metadata") or {}).get("compare_key") or item.get("source_key") or item.get("id")): item for item in current}
+    baseline_map = {str((item.get("metadata") or {}).get("compare_key") or item.get("source_key") or item.get("id")): item for item in baseline_findings}
+    new_findings = [item for key, item in current_map.items() if key not in baseline_map]
+    recurring = [item for key, item in current_map.items() if key in baseline_map]
+    resolved = [item for key, item in baseline_map.items() if key not in current_map]
+    return {
+        "assessment_id": assessment_id,
+        "baseline_assessment_id": str(baseline.get("id")),
+        "new": new_findings,
+        "recurring": recurring,
+        "resolved": resolved,
+    }
+
+
+def remediation_summary(assessment_id: str) -> dict[str, Any]:
+    findings = JOB_STORE.list_findings(assessment_id)
+    summary = {"assigned": 0, "with_due_date": 0, "overdue_open": 0, "sla_values": {}}
+    now = datetime.now(timezone.utc)
+    for finding in findings:
+        metadata = finding.get("metadata") or {}
+        owner = str(metadata.get("owner") or "").strip()
+        due_date = parse_iso_timestamp(str(metadata.get("due_date") or "")) if str(metadata.get("due_date") or "").strip() else None
+        sla = str(metadata.get("sla") or "").strip()
+        status = str(finding.get("status") or "open").lower()
+        if owner:
+            summary["assigned"] += 1
+        if due_date:
+            summary["with_due_date"] += 1
+        if due_date and due_date < now and status in {"open", "accepted-risk"}:
+            summary["overdue_open"] += 1
+        if sla:
+            summary["sla_values"][sla] = summary["sla_values"].get(sla, 0) + 1
+    return summary
+
+
+def assessment_detail(
+    assessment_id: str,
+    *,
+    findings: list[dict[str, Any]] | None = None,
+    approvals: list[dict[str, Any]] | None = None,
+    jobs: list[dict[str, Any]] | None = None,
+    pending: list[dict[str, Any]] | None = None,
+    diff: dict[str, Any] | None = None,
+    drift: dict[str, Any] | None = None,
+    severity_summary: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    findings = findings if findings is not None else JOB_STORE.list_findings(assessment_id)
+    approvals = approvals if approvals is not None else JOB_STORE.list_approvals(assessment_id)
+    jobs = jobs if jobs is not None else assessment_jobs_resolved(assessment_id)
+    pending = pending if pending is not None else assessment_pending_approval_modules(assessment_id)
+    diff = diff if diff is not None else assessment_findings_diff(assessment_id, findings=findings)
+    drift = drift if drift is not None else assessment_exposure_drift(assessment_id)
+    remediation = remediation_summary(assessment_id)
+    severity_summary = severity_summary if severity_summary is not None else assessment_findings_summary(assessment_id)["severity_summary"]
+    return {
+        "assessment_id": assessment_id,
+        "job_count": len(jobs),
+        "approval_count": 0,
+        "finding_count": len(findings),
+        "pending_approval_count": 0,
+        "pending_approval_modules": [],
+        "severity_summary": severity_summary,
+        "workspace": str((assessment.get("metadata") or {}).get("workspace") or "-"),
+        "last_job_updated_at": jobs[0].get("updated_at") if jobs else assessment.get("updated_at"),
+        "diff_summary": {"baseline_assessment_id": diff.get("baseline_assessment_id"), "new": len(diff.get("new", [])), "recurring": len(diff.get("recurring", [])), "resolved": len(diff.get("resolved", []))},
+        "drift_summary": drift.get("summary", {}),
+        "remediation_summary": remediation,
+    }
+
+
+def assessment_correlation(assessment_id: str, *, jobs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    jobs = jobs if jobs is not None else assessment_jobs_resolved(assessment_id)
+    evidence = [item for job in jobs for item in job.get("evidence", []) if isinstance(item, dict)]
+    completed = set()
+    for job in jobs:
+        completed.update(completed_module_ids(job))
+    services: list[dict[str, str]] = []
+    service_seen: set[str] = set()
+    open_ports: list[str] = []
+    web_ports: list[str] = []
+    paths: list[str] = []
+    exposed_files: list[str] = []
+    subdomains: list[str] = []
+    dns_records: list[str] = []
+    download_urls: list[str] = []
+    module_hits: dict[str, int] = {}
+    for job in jobs:
+        for service in infer_service_inventory(job):
+            key = json.dumps(service, sort_keys=True)
+            if key in service_seen:
+                continue
+            service_seen.add(key)
+            services.append(service)
+    for item in evidence:
+        module_id = str(item.get("module_id") or "")
+        if module_id:
+            module_hits[module_id] = module_hits.get(module_id, 0) + 1
+        artifacts = item.get("artifacts", {}) if isinstance(item, dict) else {}
+        for port in artifacts.get("web_ports", []) if isinstance(artifacts, dict) else []:
+            value = str(port).strip()
+            if value and value not in web_ports:
+                web_ports.append(value)
+        for entry in artifacts.get("open_ports", []) if isinstance(artifacts, dict) else []:
+            if isinstance(entry, dict):
+                value = str(entry.get("port") or "").strip()
+            else:
+                value = str(entry).strip()
+            if value and value not in open_ports:
+                open_ports.append(value)
+        for value in artifacts.get("paths", []) if isinstance(artifacts, dict) else []:
+            item_value = str(value).strip()
+            if item_value and item_value not in paths:
+                paths.append(item_value)
+        for value in artifacts.get("exposed_files", []) if isinstance(artifacts, dict) else []:
+            item_value = str(value).strip()
+            if item_value and item_value not in exposed_files:
+                exposed_files.append(item_value)
+        for value in artifacts.get("subdomains", []) if isinstance(artifacts, dict) else []:
+            item_value = str(value).strip()
+            if item_value and item_value not in subdomains:
+                subdomains.append(item_value)
+        for value in artifacts.get("dns_records", []) if isinstance(artifacts, dict) else []:
+            item_value = str(value).strip()
+            if item_value and item_value not in dns_records:
+                dns_records.append(item_value)
+        download_url = str(artifacts.get("download_url") or "").strip() if isinstance(artifacts, dict) else ""
+        if download_url and download_url not in download_urls:
+            download_urls.append(download_url)
+
+    def make_priority(priority_id: str, title: str, reason: str, module_ids: list[str]) -> dict[str, Any] | None:
+        filtered = [module_id for module_id in module_ids if module_id in MODULE_BY_ID and module_id not in completed]
+        if not filtered:
+            return None
+        highest = max((MODULE_BY_ID[module_id].risk_class for module_id in filtered), key=lambda value: {"safe": 0, "deep": 1, "intrusive": 2}.get(value, 0), default="safe")
+        return {
+            "id": priority_id,
+            "title": title,
+            "reason": reason,
+            "module_ids": filtered,
+            "modules": [MODULE_BY_ID[module_id].title for module_id in filtered],
+            "risk_class": highest,
+        }
+
+    priorities: list[dict[str, Any]] = []
+    if web_ports or paths:
+        item = make_priority(
+            "web-surface",
+            "Korelasi permukaan web",
+            "Port web atau route exposure sudah muncul. Lanjutkan korelasi header, fingerprint, dan path untuk memvalidasi prioritas hardening.",
+            ["baseline-web-fingerprint", "web-security-header-audit", "baseline-content-discovery", "baseline-gobuster-routes"],
+        )
+        if item:
+            priorities.append(item)
+    if subdomains or dns_records:
+        item = make_priority(
+            "dns-vhost",
+            "Korelasi DNS dan virtual host",
+            "Ada indikasi record DNS/subdomain. Validasi naming, vhost, dan coverage permukaan agar scope assessment lebih utuh.",
+            ["recon-dns-enumeration", "recon-amass-expansion", "baseline-tls-dns-review"],
+        )
+        if item:
+            priorities.append(item)
+    if exposed_files or download_urls:
+        item = make_priority(
+            "config-leakage",
+            "Validasi kebocoran konfigurasi atau file sensitif",
+            "Evidence menunjukkan file sensitif atau URL unduhan. Prioritaskan triage kredensial/config leakage secara terkendali.",
+            ["sensitive-file-discovery", "read-sensitive-file"],
+        )
+        if item:
+            priorities.append(item)
+    if open_ports and not priorities:
+        item = make_priority(
+            "service-expansion",
+            "Perluas inventaris service",
+            "Port terbuka sudah terdeteksi tetapi korelasi layer aplikasi masih minim. Lanjutkan baseline service dan TLS.",
+            ["recon-service-scan", "baseline-tls-dns-review", "baseline-web-fingerprint"],
+        )
+        if item:
+            priorities.append(item)
+
+    return {
+        "assessment_id": assessment_id,
+        "job_count": len(jobs),
+        "evidence_count": len(evidence),
+        "completed_modules": len(completed),
+        "service_inventory": services[:20],
+        "signals": {
+            "open_ports": open_ports,
+            "web_ports": web_ports,
+            "paths": paths[:30],
+            "exposed_files": exposed_files[:20],
+            "subdomains": subdomains[:20],
+            "dns_records": dns_records[:20],
+            "download_urls": download_urls[:10],
+        },
+        "top_modules": sorted(({"module_id": module_id, "count": count, "title": MODULE_BY_ID[module_id].title} for module_id, count in module_hits.items() if module_id in MODULE_BY_ID), key=lambda item: (-item["count"], item["title"]))[:8],
+        "priority_queue": priorities,
+    }
+
+
+def workspace_file_manifest(base: Path, directory: Path) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for child in sorted(directory.iterdir(), key=lambda entry: (entry.is_file(), entry.name.lower())):
+        relative = child.relative_to(base).as_posix()
+        item = {
+            "path": relative,
+            "name": child.name,
+            "kind": "dir" if child.is_dir() else "file",
+            "size": child.stat().st_size if child.is_file() else 0,
+        }
+        if child.is_file():
+            item["mime"] = "text/html" if child.suffix.lower() == ".html" else "application/json" if child.suffix.lower() == ".json" else "text/plain"
+        items.append(item)
+    return items
+
+
+def ensure_workspace_artifacts(assessment_id: str) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    workspace = assessment_workspace_dir(assessment)
+    composite = assessment_composite_job(assessment_id)
+    recommendations = assessment_recommendations(assessment_id)
+    correlation = assessment_correlation(assessment_id)
+    jobs = assessment_jobs_resolved(assessment_id)
+    report_md = build_assessment_markdown_report(assessment_id)
+    report_html = build_assessment_html_report(assessment_id)
+    (workspace / "reports" / "assessment-report.md").write_text(report_md)
+    (workspace / "reports" / "assessment-report.html").write_text(report_html)
+    (workspace / "parsed" / "deep-correlation.json").write_text(json.dumps(correlation, indent=2, ensure_ascii=False))
+    findings = sync_assessment_findings(assessment_id)
+    finding_summary = assessment_findings_summary(assessment_id)
+    detail = assessment_detail(assessment_id)
+    diff = assessment_findings_diff(assessment_id)
+    drift = assessment_exposure_drift(assessment_id)
+    approvals_view = approvals_dashboard()
+    (workspace / "parsed" / "normalized-findings.json").write_text(json.dumps(findings, indent=2, ensure_ascii=False))
+    (workspace / "parsed" / "findings-summary.json").write_text(json.dumps(finding_summary, indent=2, ensure_ascii=False))
+    (workspace / "parsed" / "exposure-drift.json").write_text(json.dumps(drift, indent=2, ensure_ascii=False))
+    (workspace / "parsed" / "approvals-dashboard.json").write_text(json.dumps(approvals_view, indent=2, ensure_ascii=False))
+    (workspace / "exports" / "assessment-evidence.json").write_text(json.dumps({
+        "assessment": assessment,
+        "recommendations": recommendations,
+        "correlation": correlation,
+        "findings": findings,
+        "finding_summary": finding_summary,
+        "detail": detail,
+        "diff": diff,
+        "drift": drift,
+        "jobs": jobs,
+    }, indent=2, ensure_ascii=False))
+    (workspace / "exports" / "jobs-summary.json").write_text(json.dumps({
+        "assessment_id": assessment_id,
+        "job_count": len(jobs := assessment_jobs_resolved(assessment_id)),
+        "jobs": [{
+            "id": job.get("id"),
+            "scope_label": job.get("scope_label"),
+            "status": job.get("status"),
+            "progress": job.get("progress"),
+            "evidence_count": len(job.get("evidence", [])),
+            "module_count": len(job.get("module_runs", [])),
+        } for job in jobs],
+    }, indent=2, ensure_ascii=False))
+    (workspace / "logs" / "assessment-log.txt").write_text("\n".join(
+        [f"[{entry['timestamp']}] {entry['severity'].upper()} {entry['message']}" for entry in composite.get("logs", [])]
+    ))
+    sections = []
+    for section_name in ("raw", "parsed", "reports", "logs", "exports"):
+        directory = workspace / section_name
+        sections.append({"name": section_name, "entries": workspace_file_manifest(workspace, directory)})
+    return {
+        "workspace": str(workspace),
+        "sections": sections,
+    }
+
+
+def build_assessment_bundle(assessment_id: str, *, include_workspace: bool = True) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    approvals = JOB_STORE.list_approvals(assessment_id)
+    jobs = assessment_jobs_resolved(assessment_id)
+    findings = sync_assessment_findings(assessment_id)
+    finding_summary = assessment_findings_summary(assessment_id)
+    correlation = assessment_correlation(assessment_id, jobs=jobs)
+    pending = assessment_pending_approval_modules(assessment_id)
+    recommendations = assessment_recommendations(
+        assessment_id,
+        jobs=jobs,
+        findings=findings,
+        correlation=correlation,
+        pending_approvals=pending,
+    )
+    diff = assessment_findings_diff(assessment_id, findings=findings)
+    drift = assessment_exposure_drift(assessment_id, correlation=correlation)
+    detail = assessment_detail(
+        assessment_id,
+        findings=findings,
+        approvals=approvals,
+        jobs=jobs,
+        pending=pending,
+        diff=diff,
+        drift=drift,
+        severity_summary=finding_summary.get("severity_summary", {}),
+    )
+    payload = {
+        "assessment": assessment,
+        "approvals": approvals,
+        "recommendations": recommendations,
+        "correlation": correlation,
+        "findings": findings,
+        "finding_summary": finding_summary,
+        "detail": detail,
+        "diff": diff,
+        "drift": drift,
+        "approvals_dashboard": approvals_dashboard(),
+    }
+    if include_workspace:
+        payload["workspace"] = ensure_workspace_artifacts(assessment_id)
+    return payload
+
+
+def read_workspace_file(assessment_id: str, relative_path: str) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    workspace = assessment_workspace_dir(assessment).resolve()
+    candidate = (workspace / relative_path).resolve()
+    if workspace not in candidate.parents and candidate != workspace:
+        raise HTTPException(status_code=400, detail="Workspace path is invalid")
+    if not candidate.exists() or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Workspace file not found")
+    content = candidate.read_text(errors="replace")
+    return {
+        "path": candidate.relative_to(workspace).as_posix(),
+        "name": candidate.name,
+        "mime": "text/html" if candidate.suffix.lower() == ".html" else "application/json" if candidate.suffix.lower() == ".json" else "text/plain",
+        "content": content,
+    }
+
+
+def approval_required(module, risk_mode: str) -> bool:
+    return False
+
+
+def parse_iso_timestamp(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=f"Timestamp tidak valid: {value}") from error
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def is_approval_expired(approval: dict[str, Any] | None) -> bool:
+    if not approval:
+        return False
+    expires_at = parse_iso_timestamp(str(approval.get("expires_at") or ""))
+    return bool(expires_at and expires_at <= datetime.now(timezone.utc))
+
+
+def require_valid_approval_record(approval: dict[str, Any] | None, detail: str) -> dict[str, Any]:
+    if not approval:
+        raise HTTPException(status_code=403, detail=detail)
+    if is_approval_expired(approval):
+        raise HTTPException(status_code=403, detail="Stored approval has expired and must be renewed")
+    return approval
+
+
+def range_password_configured() -> bool:
+    return bool(RANGE_SAVE_PASSWORD_HASH or RANGE_SAVE_PASSWORD)
+
+
+def verify_range_password(candidate: str) -> bool:
+    if not range_password_configured():
+        return False
+    provided = str(candidate or "")
+    if RANGE_SAVE_PASSWORD_HASH:
+        digest = hashlib.sha256(provided.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(digest, RANGE_SAVE_PASSWORD_HASH)
+    return hmac.compare_digest(provided, RANGE_SAVE_PASSWORD)
+
+
+def destructive_approval_module_id(action: str) -> str:
+    return f"destructive:{str(action or '').strip()}"
+
+
+def destructive_confirmation_token(assessment_id: str, action: str, target: str) -> str:
+    return f"CONFIRM-DESTRUCTIVE::{assessment_id}::{action}::{target}"
+
+
+def validate_assessment_access(assessment_id: str, target: str, risk_mode: str, target_kind: str = "ip") -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    if str(assessment.get("target")) != str(target):
+        raise HTTPException(status_code=409, detail="Assessment target does not match requested target")
+    if normalize_target_kind(str(assessment.get("target_kind") or "ip")) != normalize_target_kind(target_kind):
+        raise HTTPException(status_code=409, detail="Assessment target kind does not match requested target kind")
+    assessment_risk_mode = normalize_risk_mode(str(assessment.get("risk_mode") or "safe"))
+    requested_risk_mode = normalize_risk_mode(risk_mode)
+    if assessment_risk_mode != requested_risk_mode and requested_risk_mode == "intrusive":
+        raise HTTPException(status_code=409, detail="Assessment risk mode does not allow intrusive execution")
+    return assessment
+
+
+def ensure_module_approval(assessment_id: str, module, risk_mode: str) -> dict[str, Any] | None:
+    return None
 
 def register_active_process(job_id: str, process: subprocess.Popen[str]) -> None:
     if not job_id or job_id in {"temp", "destructive"}:
@@ -733,7 +2091,7 @@ def progress_heartbeat_value(current_progress: int, elapsed: float, timeout: int
     projected = 50 + int((elapsed / timeout) * 25)
     return min(85, max(current_progress, projected))
 
-def execute_command_with_progress(command: str, job_id: str, target: str = "", timeout: int = COMMAND_TIMEOUT_SECONDS, capture_output: bool = True) -> dict[str, Any]:
+def execute_command_with_progress(command: str, job_id: str, target: str = "", timeout: int = COMMAND_TIMEOUT_SECONDS, capture_output: bool = True, stdin_text: str | None = None) -> dict[str, Any]:
     safe_target = str(target).strip()
     
     raw_cmd = command
@@ -754,12 +2112,13 @@ def execute_command_with_progress(command: str, job_id: str, target: str = "", t
     cmd_parts = validation_cmd.split()
     if cmd_parts:
         base_cmd = cmd_parts[0]
+        effective_base_cmd = effective_base_command_from_parts(cmd_parts)
         allowed = False
         for aliases in TOOL_COMMAND_ALIASES.values():
-            if aliases and base_cmd in aliases:
+            if aliases and effective_base_cmd in aliases:
                 allowed = True
                 break
-        if not allowed and base_cmd not in ["echo", "cat", "grep", "awk", "sed", "head", "tail", "ls", "pwd", "whoami", "scp", "ssh"]:
+        if not allowed and effective_base_cmd not in ["echo", "cat", "grep", "awk", "sed", "head", "tail", "ls", "pwd", "whoami", "scp", "ssh"]:
             return {"success": False, "stdout": "", "stderr": f"Command '{base_cmd}' not allowed", "returncode": -1, "command": cmd}
     
     tool_name = infer_tool_name(cmd[5:] if cmd.startswith("exec ") else cmd)
@@ -784,6 +2143,7 @@ def execute_command_with_progress(command: str, job_id: str, target: str = "", t
             cmd,
             shell=True,
             start_new_session=(os.name == "posix"),
+            stdin=subprocess.PIPE if stdin_text is not None else None,
             stdout=stdout_target,
             stderr=stderr_target,
             text=True,
@@ -831,7 +2191,10 @@ def execute_command_with_progress(command: str, job_id: str, target: str = "", t
                     pass
             time.sleep(1)
         
-        stdout, stderr = process.communicate(timeout=timeout)
+        finalize_timeout = max(10, min(30, timeout // 3 if timeout > 0 else 15))
+        if job_id and job_id not in {"temp", "destructive"}:
+            update_runtime_meta(job_id, pid=process.pid, command=cmd, tool=tool_name, timeout=timeout, heartbeat_at=now_iso())
+        stdout, stderr = process.communicate(input=stdin_text, timeout=finalize_timeout)
 
         stdout = stdout if stdout else ""
         stderr = stderr if stderr else ""
@@ -845,9 +2208,25 @@ def execute_command_with_progress(command: str, job_id: str, target: str = "", t
         result_payload = {"success": process.returncode == 0, "stdout": stdout, "stderr": stderr, "returncode": process.returncode, "command": cmd}
         set_cached_command_result(job_id, cmd, result_payload)
         return result_payload
-    except subprocess.TimeoutExpired:
-        process.kill()
-        return {"success": False, "stdout": "", "stderr": f"Command timed out after {timeout} seconds", "returncode": -1, "command": cmd}
+    except subprocess.TimeoutExpired as error:
+        try:
+            stop_process_tree(process)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        partial_stdout = error.stdout if isinstance(error.stdout, str) else ""
+        partial_stderr = error.stderr if isinstance(error.stderr, str) else ""
+        if job_id:
+            safe_append_log(job_id, f"{tool_name} finalization timed out while draining output pipes", "warning")
+        return {
+            "success": False,
+            "stdout": partial_stdout,
+            "stderr": partial_stderr or f"Command timed out after {timeout} seconds",
+            "returncode": -1,
+            "command": cmd,
+        }
     except Exception as e:
         return {"success": False, "stdout": "", "stderr": str(e), "returncode": -1, "command": cmd}
     finally:
@@ -933,9 +2312,9 @@ def module_command_preview(module_id: str, target: str = "TARGET", execution_pro
             ],
         },
         "baseline-gobuster-routes": {
-            "fast": [f"ffuf -u http://{target}/FUZZ -w {web_wordlist} -mc 200,301,302,403 -fc 404 -t 20 -timeout 8 -s -of json -o ffuf-routes-{target}.json", f"# parse ffuf route matches into route evidence"],
-            "balanced": [f"ffuf -u http://{target}/FUZZ -w {web_wordlist} -mc 200,301,302,403 -fc 404 -t 25 -timeout 10 -s -of json -o ffuf-routes-{target}.json", f"# parse ffuf route matches into route evidence"],
-            "deep": [f"gobuster dir -u http://{target} -w {web_wordlist} -k -q -x php,txt,bak,zip -t 30", f"# parse gobuster matches into route evidence"],
+            "fast": [f"ffuf -u http://{target}/FUZZ -w {web_wordlist} -ac -mc 200,301,302,403 -t 20 -timeout 8 -s -of json -o ffuf-routes-{target}.json", f"# ffuf auto-calibration helps when the target uses wildcard or fallback pages"],
+            "balanced": [f"ffuf -u http://{target}/FUZZ -w {web_wordlist} -ac -mc 200,301,302,403 -t 25 -timeout 10 -s -of json -o ffuf-routes-{target}.json", f"# ffuf auto-calibration helps when the target uses wildcard or fallback pages"],
+            "deep": [f"ffuf -u http://{target}/FUZZ -w {web_wordlist} -ac -mc 200,204,301,302,307,401,403 -t 30 -timeout 10 -s -of json -o ffuf-routes-{target}.json", f"gobuster dir -u http://{target} -w {web_wordlist} -k -q -x php,txt,bak,zip -t 30 --wildcard", f"# prefer ffuf -ac first; gobuster --wildcard is a noisier fallback when the site answers 200 on random paths"],
         },
         "baseline-tls-dns-review": {
             "fast": [f"openssl s_client -connect {target}:443 -servername {target} -tls1_2 < /dev/null 2>/dev/null | openssl x509 -noout -text"],
@@ -1058,9 +2437,9 @@ def module_command_preview(module_id: str, target: str = "TARGET", execution_pro
         return [f"# No command preview mapped for {module_id}"]
     return by_profile.get(profile) or by_profile.get("balanced") or next(iter(by_profile.values()))
 
-def serialize_module(module) -> dict[str, object]:
+def serialize_module(module, include_runtime_detail: bool = False) -> dict[str, object]:
     playbook = module_playbook(module)
-    return {
+    payload = {
         "id": module.id,
         "title": module.title,
         "phase_id": module.phase_id,
@@ -1068,6 +2447,12 @@ def serialize_module(module) -> dict[str, object]:
         "phase_order": module.phase_order,
         "description": module.description,
         "risk": module.risk,
+        "risk_class": module.risk_class,
+        "requires_approval": module.requires_approval,
+        "safe_in_chain": module.safe_in_chain,
+        "deep_in_chain": module.deep_in_chain,
+        "manual_confirmation": module.manual_confirmation,
+        "target_kinds": list(module.target_kinds),
         "mitre": module.mitre,
         "engine": module.engine,
         "mode": module.mode,
@@ -1081,15 +2466,17 @@ def serialize_module(module) -> dict[str, object]:
         "depth_profile": playbook.depth_profile,
         "allowed_checks": list(playbook.allowed_checks),
         "simulation_stance": playbook.simulation_stance,
-        "tooling_details": [tool_status(label) for label in playbook.tooling],
         "profile_options": ["fast", "balanced", "deep"],
         "default_profile": "balanced",
-        "command_preview_by_profile": {
+    }
+    if include_runtime_detail:
+        payload["tooling_details"] = [tool_status(label) for label in playbook.tooling]
+        payload["command_preview_by_profile"] = {
             "fast": module_command_preview(module.id, "TARGET", "fast"),
             "balanced": module_command_preview(module.id, "TARGET", "balanced"),
             "deep": module_command_preview(module.id, "TARGET", "deep"),
-        },
-    }
+        }
+    return payload
 
 def lookup_asset(target: str) -> dict[str, str] | None:
     asset = ASSET_BY_IP.get(target)
@@ -1102,10 +2489,27 @@ def make_log(message: str, severity: str = "info", timestamp: str | None = None)
     return {"timestamp": timestamp or now_iso(), "severity": severity, "message": message}
 
 # ============ Job Management ============
-def create_job(scope_type: str, scope_label: str, target: str, note: str, module_ids: list[str], execution_profile: str = "balanced") -> dict[str, Any]:
+def create_job(
+    scope_type: str,
+    scope_label: str,
+    target: str,
+    note: str,
+    module_ids: list[str],
+    execution_profile: str = "balanced",
+    *,
+    assessment_id: str = "",
+    risk_mode: str = "safe",
+    chain_preset: str = "full-chain-default",
+) -> dict[str, Any]:
     job_id = str(uuid.uuid4())
     created_at = now_iso()
     normalized_profile = normalize_execution_profile(execution_profile)
+    normalized_risk_mode = normalize_risk_mode(risk_mode)
+    runtime_meta = {
+        "assessment_id": assessment_id,
+        "risk_mode": normalized_risk_mode,
+        "chain_preset": normalize_chain_preset(chain_preset),
+    }
     job = {
         "id": job_id,
         "scope_type": scope_type,
@@ -1122,13 +2526,14 @@ def create_job(scope_type: str, scope_label: str, target: str, note: str, module
             make_log(f"Scope: {scope_label}"),
             make_log(f"Target: {target}"),
             make_log(f"Execution mode: {EXECUTION_MODE} 🔥 LIVE"),
-            make_log(f"Destructive mode: {DESTRUCTIVE_MODE} ⚠️ FULL"),
+            make_log(f"Destructive mode: {DESTRUCTIVE_MODE}"),
+            make_log(f"Risk mode: {normalized_risk_mode}"),
             make_log(f"Execution profile: {normalized_profile}"),
             make_log(f"Module count: {len(module_ids)}"),
         ],
         "severity_summary": blank_severity_summary(),
         "evidence": [],
-        "runtime_meta": {},
+        "runtime_meta": runtime_meta,
         "module_runs": [
             {
                 "module_id": module_id,
@@ -1204,6 +2609,10 @@ def add_evidence(job_id: str, item: dict[str, Any]) -> bool:
             evidence.append(normalized_item)
         severity_summary = recompute_severity_summary(evidence)
         JOB_STORE.update_job(job_id, severity_summary=severity_summary, evidence=evidence, updated_at=now_iso())
+        assessment_id = str(runtime_meta(job).get("assessment_id") or "")
+        if assessment_id:
+            JOB_STORE.update_assessment(assessment_id, updated_at=now_iso(), metadata=None)
+            sync_assessment_findings(assessment_id)
         return not replaced
     except Exception:
         return False
@@ -1651,6 +3060,48 @@ def parse_gobuster_result_entries(output: str) -> list[dict[str, Any]]:
         seen.add(marker)
         entries.append({"path": path, "status": status, "redirect": redirect, "url": ""})
     return entries[:40]
+
+def extract_gobuster_exclude_length(stderr: str) -> int | None:
+    text = str(stderr or "")
+    if "the server returns a status code that matches the provided options for non existing urls" not in text.lower():
+        return None
+    match = re.search(r"\(Length:\s*(?P<length>\d+)\)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group("length"))
+    except (TypeError, ValueError):
+        return None
+
+
+def build_gobuster_dir_command(
+    base_url: str,
+    wordlist: str,
+    *,
+    threads: int,
+    extensions: str = "",
+    wildcard: bool = False,
+    exclude_length: int | None = None,
+) -> str:
+    parts = [
+        "gobuster",
+        "dir",
+        "-u",
+        base_url,
+        "-w",
+        wordlist,
+        "-k",
+        "-q",
+        "-t",
+        str(threads),
+    ]
+    if extensions:
+        parts.extend(["-x", extensions])
+    if wildcard:
+        parts.append("--wildcard")
+    if exclude_length is not None and exclude_length >= 0:
+        parts.extend(["--exclude-length", str(exclude_length)])
+    return shlex.join(parts)
 
 def parse_hydra_credentials(output: str) -> list[str]:
     hits: list[str] = []
@@ -2337,6 +3788,7 @@ def real_nikto_review(target: str, job_id: str = "", execution_profile: str = "b
 def real_gobuster_routes(target: str, job_id: str = "", execution_profile: str = "balanced") -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     profile = normalize_execution_profile(execution_profile)
+    base_url = f"http://{target}"
     
     try:
         if job_id:
@@ -2353,13 +3805,30 @@ def real_gobuster_routes(target: str, job_id: str = "", execution_profile: str =
     events.append({"kind": "log", "severity": "warning", "message": f"🔥 Running Gobuster directory scan ({profile})"})
     
     if profile == "fast":
-        cmd = f"gobuster dir -u http://{target} -w {wordlist} -k -q -t 20"
+        cmd = build_gobuster_dir_command(base_url, wordlist, threads=20, wildcard=True)
     elif profile == "deep":
-        cmd = f"gobuster dir -u http://{target} -w {wordlist} -k -q -x php,txt,bak,zip -t 30"
+        cmd = build_gobuster_dir_command(base_url, wordlist, threads=30, extensions="php,txt,bak,zip", wildcard=True)
     else:
-        cmd = f"gobuster dir -u http://{target} -w {wordlist} -k -q -t 25"
+        cmd = build_gobuster_dir_command(base_url, wordlist, threads=25, wildcard=True)
     
     result = execute_command_with_progress(cmd, job_id if job_id else "temp", target, timeout=180 if profile == "deep" else 120)
+    if not result["success"]:
+        exclude_length = extract_gobuster_exclude_length(result.get("stderr", ""))
+        if exclude_length is not None:
+            retry_cmd = build_gobuster_dir_command(
+                base_url,
+                wordlist,
+                threads=30 if profile == "deep" else (20 if profile == "fast" else 25),
+                extensions="php,txt,bak,zip" if profile == "deep" else "",
+                exclude_length=exclude_length,
+            )
+            events.append({
+                "kind": "log",
+                "severity": "warning",
+                "message": f"Gobuster wildcard detected. Retrying with --exclude-length {exclude_length}.",
+            })
+            result = execute_command_with_progress(retry_cmd, job_id if job_id else "temp", target, timeout=180 if profile == "deep" else 120)
+            cmd = retry_cmd
     if result["success"] and result["stdout"]:
         entries = parse_gobuster_result_entries(result["stdout"])
         if entries:
@@ -2405,9 +3874,9 @@ def real_route_enumeration_light(target: str, job_id: str = "", execution_profil
     if prefer_ffuf and check_tool_availability("ffuf"):
         events.append({"kind": "log", "severity": "warning", "message": f"Running lightweight route enumeration with ffuf ({profile})"})
         if profile == "fast":
-            cmd = f"ffuf -u {primary_url}/FUZZ -w {wordlist} -mc 200,301,302,403 -fc 404 -t 20 -timeout 8 -s -of json -o ffuf-routes-{target}.json"
+            cmd = f"ffuf -u {primary_url}/FUZZ -w {wordlist} -ac -mc 200,301,302,403 -t 20 -timeout 8 -s -of json -o ffuf-routes-{target}.json"
         else:
-            cmd = f"ffuf -u {primary_url}/FUZZ -w {wordlist} -mc 200,301,302,403 -fc 404 -t 25 -timeout 10 -s -of json -o ffuf-routes-{target}.json"
+            cmd = f"ffuf -u {primary_url}/FUZZ -w {wordlist} -ac -mc 200,301,302,403 -t 25 -timeout 10 -s -of json -o ffuf-routes-{target}.json"
         result = execute_command_with_progress(cmd, job_id if job_id else "temp", target, timeout=120, capture_output=False)
         if result.get("cancelled"):
             events.append({"kind": "log", "severity": "warning", "message": "Route enumeration stopped by operator"})
@@ -2443,11 +3912,28 @@ def real_route_enumeration_light(target: str, job_id: str = "", execution_profil
 
     if check_tool_availability("gobuster"):
         events.append({"kind": "log", "severity": "warning", "message": f"Running deep route enumeration with gobuster ({profile})"})
-        cmd = f"gobuster dir -u {primary_url} -w {wordlist} -k -q -x php,txt,bak,zip -t 30"
+        cmd = build_gobuster_dir_command(primary_url, wordlist, threads=30, extensions="php,txt,bak,zip", wildcard=True)
         result = execute_command_with_progress(cmd, job_id if job_id else "temp", target, timeout=180)
         if result.get("cancelled"):
             events.append({"kind": "log", "severity": "warning", "message": "Route enumeration stopped by operator"})
             return events
+        if not result["success"]:
+            exclude_length = extract_gobuster_exclude_length(result.get("stderr", ""))
+            if exclude_length is not None:
+                retry_cmd = build_gobuster_dir_command(
+                    primary_url,
+                    wordlist,
+                    threads=30,
+                    extensions="php,txt,bak,zip",
+                    exclude_length=exclude_length,
+                )
+                events.append({
+                    "kind": "log",
+                    "severity": "warning",
+                    "message": f"Gobuster wildcard detected. Retrying with --exclude-length {exclude_length}.",
+                })
+                result = execute_command_with_progress(retry_cmd, job_id if job_id else "temp", target, timeout=180)
+                cmd = retry_cmd
         if result["success"] and result["stdout"]:
             entries = parse_gobuster_result_entries(result["stdout"])
             if entries:
@@ -2663,16 +4149,23 @@ def real_sql_validation(target: str, job_id: str = "", execution_profile: str = 
     events.append({"kind": "log", "severity": "critical", "message": f"Running SQL injection test ({profile})"})
 
     params = ["id", "q", "page", "user", "cat"]
-    param_limit = 1 if profile == "fast" else 2 if profile == "balanced" else 4
+    param_limit = 1 if profile == "fast" else 1 if profile == "balanced" else 2
+    tested_params: list[str] = []
     for param in params[:param_limit]:
+        tested_params.append(param)
         if profile == "fast":
-            cmd = f"sqlmap -u {primary_url}/?{param}=1 --batch --risk=1 --level=1 --timeout=10"
+            cmd = f"sqlmap -u {primary_url}/?{param}=1 --batch --smart --risk=1 --level=1 --timeout=10 --retries=1 --keep-alive"
         elif profile == "deep":
-            cmd = f"sqlmap -u {primary_url}/?{param}=1 --batch --risk=3 --level=3 --threads=4 --timeout=30"
+            cmd = f"sqlmap -u {primary_url}/?{param}=1 --batch --smart --risk=2 --level=2 --threads=2 --timeout=20 --retries=1 --keep-alive"
         else:
-            cmd = f"sqlmap -u {primary_url}/?{param}=1 --batch --risk=2 --level=2 --timeout=20"
+            cmd = f"sqlmap -u {primary_url}/?{param}=1 --batch --smart --risk=2 --level=2 --timeout=15 --retries=1 --keep-alive"
 
-        result = execute_command_with_progress(cmd, job_id if job_id else "temp", target, timeout=180 if profile == "deep" else 120)
+        if job_id:
+            safe_append_log(job_id, f"Testing injectable parameter candidate: {param}", "info")
+        result = execute_command_with_progress(cmd, job_id if job_id else "temp", target, timeout=120 if profile == "deep" else 90)
+        if result.get("cancelled"):
+            events.append({"kind": "log", "severity": "warning", "message": "SQL validation stopped by operator"})
+            return events
         if result["success"] and "vulnerable" in result["stdout"].lower():
             sql_findings = extract_interesting_lines(result["stdout"], [r"\[CRITICAL\]", r"\[WARNING\]", r"Parameter:", r"Type:", r"Title:", r"back-end DBMS", r"payload"], limit=12)
             events.append({
@@ -2688,10 +4181,28 @@ def real_sql_validation(target: str, job_id: str = "", execution_profile: str = 
                 },
             })
             break
+        if result.get("stderr"):
+            stderr_lines = unique_text_lines([line for line in str(result["stderr"]).splitlines() if line.strip()], limit=4)
+            if stderr_lines:
+                events.append({"kind": "log", "severity": "warning", "message": f"sqlmap note ({param}): {' ; '.join(stderr_lines)}"})
+        if result.get("stdout"):
+            summary_lines = extract_interesting_lines(
+                result["stdout"],
+                [r"all tested parameters do not appear to be injectable", r"does not seem to be injectable", r"\[WARNING\]", r"\[ERROR\]"],
+                limit=4,
+            )
+            if summary_lines:
+                events.append({"kind": "log", "severity": "info", "message": f"sqlmap summary ({param}): {' ; '.join(summary_lines)}"})
 
     if job_id:
         safe_update_progress(job_id, 90)
         safe_append_log(job_id, "SQL validation completed", "info")
+    if not any(event.get("kind") == "evidence" for event in events):
+        events.append({
+            "kind": "log",
+            "severity": "info",
+            "message": f"No injectable parameter confirmed from quick sqlmap validation ({', '.join(tested_params) or 'none'}).",
+        })
 
     return events
 
@@ -3331,6 +4842,20 @@ def discover_sensitive_files(target: str, job_id: str = "", execution_profile: s
             "/server-status",
         ])
 
+    wildcard_fingerprints: dict[str, tuple[int, int, str]] = {}
+    for probe_url in candidate_web_urls(target, f"/__lab_probe_missing__{uuid.uuid4().hex}"):
+        probe_result = fetch_url_sample(probe_url, max_bytes=24576)
+        probe_status = int(probe_result.get("status") or 0)
+        probe_content = decode_sample_body(probe_result.get("body") or b"")
+        probe_fingerprint = hashlib.sha1(probe_content.strip().encode("utf-8", errors="ignore")).hexdigest()[:16] if probe_content.strip() else ""
+        parsed_probe = urlparse(probe_url)
+        origin = f"{parsed_probe.scheme}://{parsed_probe.netloc}"
+        wildcard_fingerprints[origin] = (
+            probe_status,
+            len(probe_content.strip()),
+            probe_fingerprint,
+        )
+
     discovered: list[str] = []
     exposed_files: list[str] = []
     checked_urls: list[str] = []
@@ -3344,8 +4869,27 @@ def discover_sensitive_files(target: str, job_id: str = "", execution_profile: s
             content = decode_sample_body(fetch_result.get("body") or b"")
             if not content or looks_like_html_error(content):
                 continue
+            stripped = content.strip()
+            parsed_url = urlparse(url)
+            origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            baseline_status, baseline_len, baseline_fingerprint = wildcard_fingerprints.get(origin, (0, 0, ""))
+            content_fingerprint = hashlib.sha1(stripped.encode("utf-8", errors="ignore")).hexdigest()[:16] if stripped else ""
+            if (
+                baseline_status in {200, 206}
+                and baseline_fingerprint
+                and baseline_fingerprint == content_fingerprint
+                and abs(len(stripped) - baseline_len) <= 24
+            ):
+                continue
+            sensitive_lines = extract_sensitive_lines(content)
+            artifact_match = re.search(r"(\.env|config\.php|wp-config\.php|\.sql|\.git/config|\.htpasswd|backup\.(zip|sql|tar\.gz))", path, flags=re.IGNORECASE)
+            lowered = stripped.lower()
+            if ("<html" in lowered or "<!doctype html" in lowered) and not sensitive_lines:
+                continue
+            if not sensitive_lines and not artifact_match and len(stripped) < 24:
+                continue
             discovered.append(path)
-            if extract_sensitive_lines(content) or re.search(r"(\.env|config\.php|wp-config\.php|\.sql|\.git/config|\.htpasswd)", path, flags=re.IGNORECASE):
+            if sensitive_lines or artifact_match:
                 exposed_files.append(path)
             break
 
@@ -3545,7 +5089,7 @@ def module_runtime_events(module, target: str, note: str, job_id: str = "", exec
     events: list[dict[str, Any]] = [
         {"kind": "log", "severity": "info", "message": f"Operator note: {note or 'Default'}"},
         {"kind": "log", "severity": "warning", "message": f"🔥 EXECUTION: LIVE - Full capabilities"},
-        {"kind": "log", "severity": "warning", "message": f"⚠️ DESTRUCTIVE: ENABLED"},
+        {"kind": "log", "severity": "warning", "message": f"⚠️ DESTRUCTIVE: {DESTRUCTIVE_MODE.upper()}"},
         {"kind": "log", "severity": "info", "message": f"Execution profile: {profile}"},
         {"kind": "log", "severity": "info", "message": f"Target: {target}"},
         {"kind": "log", "severity": "info", "message": f"Module: {module.title} ({module.phase_label})"},
@@ -3578,7 +5122,7 @@ def run_job(job_id: str) -> None:
             return
         append_log(job_id, "Job accepted by worker.", status="running", progress=1)
         append_log(job_id, f"🔥 Execution: LIVE - Full capabilities", severity="warning")
-        append_log(job_id, f"⚠️ Destructive: ENABLED", severity="warning")
+        append_log(job_id, f"⚠️ Destructive: {DESTRUCTIVE_MODE.upper()}", severity="warning")
         if str(job.get("scope_type")) == "chain":
             append_log(job_id, "Running target preflight reachability check.", severity="info", progress=2)
             if not target_preflight_reachable(str(job["target"])):
@@ -3670,6 +5214,37 @@ def run_job(job_id: str) -> None:
 
 # ============ Report Functions ============
 def export_payload(job: dict[str, Any]) -> dict[str, Any]:
+    def tools_for_evidence_item(item: dict[str, Any]) -> list[str]:
+        module_id = str(item.get("module_id") or "")
+        module = MODULE_BY_ID.get(module_id)
+        tools: list[str] = []
+        seen: set[str] = set()
+        if module:
+            for tool in module_playbook(module).tooling:
+                if tool and tool not in seen:
+                    seen.add(tool)
+                    tools.append(tool)
+        command = str((item.get("artifacts") or {}).get("command") or "").strip()
+        if command:
+            inferred = command.split()[0].strip().lower()
+            if inferred and inferred not in seen:
+                tools.append(inferred)
+        return tools
+
+    enriched_evidence = []
+    aggregate_tools: list[str] = []
+    aggregate_seen: set[str] = set()
+    for item in job.get("evidence", []):
+        entry_tools = tools_for_evidence_item(item)
+        for tool in entry_tools:
+            if tool not in aggregate_seen:
+                aggregate_seen.add(tool)
+                aggregate_tools.append(tool)
+        enriched_evidence.append({
+            **item,
+            "tools_used": entry_tools,
+        })
+
     return {
         "job": {
             "id": job["id"],
@@ -3685,7 +5260,8 @@ def export_payload(job: dict[str, Any]) -> dict[str, Any]:
         },
         "severity_summary": job["severity_summary"],
         "module_runs": job["module_runs"],
-        "evidence": job["evidence"],
+        "tools_used": aggregate_tools,
+        "evidence": enriched_evidence,
         "logs": job["logs"],
     }
 
@@ -4220,8 +5796,8 @@ def build_markdown_report(job: dict[str, Any]) -> str:
     ])
     return "\n".join(lines)
 
-def build_html_report(job: dict[str, Any]) -> str:
-    markdown = build_markdown_report(job)
+def build_html_report(job: dict[str, Any], markdown: str | None = None) -> str:
+    markdown = markdown if markdown is not None else build_markdown_report(job)
 
     def render_inline_markdown(text: str) -> str:
         escaped = escape(text)
@@ -4321,9 +5897,40 @@ def build_html_report(job: dict[str, Any]) -> str:
 </html>"""
 
 # ============ API Endpoints ============
+@app.get("/login")
+def login_page(next: str = "/") -> HTMLResponse:
+    return _render_login_page(next_url=next)
+
+
+@app.get("/login/access")
+def login_access(next_url: str = "/", username: str = "top-management"):
+    cleaned_username = (username or "top-management").strip() or "top-management"
+    response = RedirectResponse(url=_safe_next_path(next_url), status_code=303)
+    response.set_cookie(
+        key="redteam_console_user",
+        value=cleaned_username,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=60 * 60 * 12,
+    )
+    return response
+
+
+@app.post("/logout")
+def logout() -> RedirectResponse:
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie("redteam_console_user")
+    return response
+
+
 @app.get("/")
 def read_index() -> FileResponse:
     return FileResponse(BASE_DIR / "index.html")
+
+@app.get("/favicon.ico")
+def read_favicon() -> FileResponse:
+    return FileResponse(BASE_DIR / "favicon.ico")
 
 @app.get("/styles.css")
 def read_styles() -> FileResponse:
@@ -4337,8 +5944,92 @@ def read_script() -> FileResponse:
 def healthcheck() -> dict[str, str]:
     return {"status": "ok", "mode": EXECUTION_MODE, "destructive": DESTRUCTIVE_MODE}
 
+def build_assessment_markdown_report(assessment_id: str) -> str:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    composite = assessment_composite_job(assessment_id)
+    correlation = assessment_correlation(assessment_id)
+    recommendations = assessment_recommendations(assessment_id)
+    diff = assessment_findings_diff(assessment_id)
+    drift = assessment_exposure_drift(assessment_id)
+    remediation = remediation_summary(assessment_id)
+    workspace = assessment_workspace_dir(assessment)
+    base_report = build_markdown_report(composite)
+    lines = [
+        base_report,
+        "",
+        "## 12. Ringkasan Assessment-Native",
+        "",
+        f"- Assessment ID: `{assessment_id}`",
+        f"- Target: `{assessment.get('target')}`",
+        f"- Risk mode: `{assessment.get('risk_mode')}`",
+        f"- Chain preset: `{assessment_chain_preset(assessment)}`",
+        f"- Operator: `{assessment.get('operator_name')}`",
+        f"- Ticket: `{assessment.get('ticket_ref') or '-'}`",
+        f"- Workspace: `{workspace}`",
+        f"- Total job terkait: `{correlation['job_count']}`",
+        f"- Total evidence lintas job: `{correlation['evidence_count']}`",
+        "",
+        "## 13. Korelasi Deep Assessment",
+        "",
+        f"- Port terbuka teridentifikasi: {', '.join(correlation['signals']['open_ports']) or '-'}",
+        f"- Port web: {', '.join(correlation['signals']['web_ports']) or '-'}",
+        f"- Path exposure: {', '.join(correlation['signals']['paths'][:8]) or '-'}",
+        f"- Subdomain / record DNS: {', '.join((correlation['signals']['subdomains'] + correlation['signals']['dns_records'])[:8]) or '-'}",
+        f"- File sensitif / download URL: {', '.join((correlation['signals']['exposed_files'] + correlation['signals']['download_urls'])[:8]) or '-'}",
+        "",
+        "Prioritas tindak lanjut:",
+    ]
+    priorities = correlation.get('priority_queue', [])
+    if priorities:
+        for index, item in enumerate(priorities, start=1):
+            lines.append(f"{index}. {item['title']} - {item['reason']} (modul: {', '.join(item['modules'])})")
+    else:
+        lines.append("1. Belum ada prioritas tambahan lintas-job; lanjutkan coverage sesuai recommendations default assessment.")
+    lines.extend([
+        "",
+        "## 14. Drift Exposure Antar Assessment",
+        "",
+        f"- Baseline assessment: `{drift.get('baseline_assessment_id') or '-'}`",
+        f"- Port baru: {', '.join(drift.get('new_signals', {}).get('open_ports', [])[:8]) or '-'}",
+        f"- Port resolved: {', '.join(drift.get('resolved_signals', {}).get('open_ports', [])[:8]) or '-'}",
+        f"- Path baru: {', '.join(drift.get('new_signals', {}).get('paths', [])[:8]) or '-'}",
+        f"- Path resolved: {', '.join(drift.get('resolved_signals', {}).get('paths', [])[:8]) or '-'}",
+        f"- Subdomain/DNS baru: {', '.join((drift.get('new_signals', {}).get('subdomains', []) + drift.get('new_signals', {}).get('dns_records', []))[:8]) or '-'}",
+        f"- File/download baru: {', '.join((drift.get('new_signals', {}).get('exposed_files', []) + drift.get('new_signals', {}).get('download_urls', []))[:8]) or '-'}",
+        "",
+        "## 15. Remediation Tracking",
+        "",
+        f"- Finding assigned owner: `{remediation.get('assigned', 0)}`",
+        f"- Finding dengan due date: `{remediation.get('with_due_date', 0)}`",
+        f"- Finding overdue (open/accepted-risk): `{remediation.get('overdue_open', 0)}`",
+        f"- Ringkasan SLA: `{json.dumps(remediation.get('sla_values', {}), ensure_ascii=False)}`",
+        "",
+        "## 16. Coverage Preset dan Recommendations",
+        "",
+        f"- Preset label: `{recommendations['preset']['label']}`",
+        f"- Coverage chain: `{recommendations['completed_modules']}/{recommendations['total_chain_modules']}`",
+        "- Modul berikut yang direkomendasikan:",
+    ])
+    next_modules = recommendations.get('recommended_modules', [])
+    if next_modules:
+        for item in next_modules:
+            lines.append(f"  - {item['phase_label']} - {item['title']} ({item['risk_class']})")
+    else:
+        lines.append("  - Tidak ada modul lanjutan. Coverage assessment sudah penuh.")
+    return "\n".join(lines)
+
+
+def build_assessment_html_report(assessment_id: str) -> str:
+    composite = assessment_composite_job(assessment_id)
+    markdown = build_assessment_markdown_report(assessment_id)
+    return build_html_report(composite, markdown)
+
+
 @app.get("/api/config")
 def config() -> dict[str, Any]:
+    sync_lab_config_from_disk()
     return {
         "allowed_subnets": [str(subnet) for subnet in ALLOWED_SUBNETS],
         "lab_profiles": list(LAB_PROFILES),
@@ -4346,17 +6037,18 @@ def config() -> dict[str, Any]:
         "config_path": LAB_CONFIG_PATH,
         "execution_mode": EXECUTION_MODE,
         "destructive_mode": DESTRUCTIVE_MODE,
+        "range_password_configured": range_password_configured(),
     }
 
 @app.post("/api/config/reload")
 def reload_config() -> dict[str, Any]:
-    config_data = load_lab_config()
-    apply_lab_config(config_data)
+    sync_lab_config_from_disk(force=True)
     return {"message": "Configuration reloaded", "config": config()}
 
 @app.post("/api/config/allowed-subnets")
 def update_allowed_subnets(payload: ConfigUpdateRequest) -> dict[str, Any]:
-    if payload.password != RANGE_SAVE_PASSWORD:
+    sync_lab_config_from_disk()
+    if range_password_configured() and not verify_range_password(payload.password):
         raise HTTPException(status_code=403, detail="Password simpan ranges tidak valid.")
     cleaned = [item.strip() for item in payload.allowed_subnets if item.strip()]
     if not cleaned:
@@ -4367,7 +6059,11 @@ def update_allowed_subnets(payload: ConfigUpdateRequest) -> dict[str, Any]:
 
 @app.get("/api/modules")
 def modules() -> dict[str, Any]:
-    return {"modules": [serialize_module(module) for module in MODULES]}
+    return {"modules": [serialize_module(module, include_runtime_detail=False) for module in MODULES]}
+
+@app.get("/api/chain-presets")
+def chain_presets() -> dict[str, Any]:
+    return {"presets": list(CHAIN_PRESETS.values())}
 
 @app.get("/api/modules/{module_id}/dry-run")
 def module_dry_run(module_id: str, target: str, note: str = "", execution_profile: str = "balanced") -> dict[str, Any]:
@@ -4414,6 +6110,223 @@ def get_asset(target: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Asset not found")
     return {"asset": asset}
 
+@app.get("/api/assessments")
+def list_assessments() -> dict[str, Any]:
+    assessments = JOB_STORE.list_assessments()
+    enriched: list[dict[str, Any]] = []
+    for assessment in assessments:
+        assessment_id = str(assessment.get("id") or "")
+        findings = JOB_STORE.list_findings(assessment_id)
+        enriched.append({
+            **assessment,
+            "finding_count": len(findings),
+            "finding_severity_summary": assessment_findings_summary(assessment_id)["severity_summary"] if assessment_id else {},
+        })
+    return {"assessments": enriched}
+
+@app.get("/api/assessments/{assessment_id}")
+def get_assessment(assessment_id: str) -> dict[str, Any]:
+    return build_assessment_bundle(assessment_id, include_workspace=True)
+
+@app.get("/api/assessments/{assessment_id}/findings")
+def get_assessment_findings(assessment_id: str) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    findings = sync_assessment_findings(assessment_id)
+    return {"assessment_id": assessment_id, "findings": findings, "summary": assessment_findings_summary(assessment_id)}
+
+@app.get("/api/assessments/{assessment_id}/diff")
+def get_assessment_diff(assessment_id: str) -> dict[str, Any]:
+    sync_assessment_findings(assessment_id)
+    return assessment_findings_diff(assessment_id)
+
+@app.patch("/api/assessments/{assessment_id}/findings/{finding_id}")
+def update_assessment_finding(assessment_id: str, finding_id: str, payload: FindingStatusRequest) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    status = str(payload.status or "open").strip().lower()
+    if status not in {"open", "accepted-risk", "mitigated", "false-positive"}:
+        raise HTTPException(status_code=400, detail="Status finding tidak valid")
+    current = JOB_STORE.get_finding(assessment_id, finding_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    metadata = dict(current.get("metadata") or {})
+    metadata["status_note"] = str(payload.note or "").strip()
+    metadata["status_updated_at"] = now_iso()
+    metadata["owner"] = str(payload.owner or "").strip()
+    metadata["due_date"] = str(payload.due_date or "").strip()
+    metadata["sla"] = str(payload.sla or "").strip()
+    finding = JOB_STORE.update_finding(assessment_id, finding_id, status=status, metadata=metadata, updated_at=now_iso())
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    return {"finding": finding, "summary": assessment_findings_summary(assessment_id), "diff": assessment_findings_diff(assessment_id), "detail": assessment_detail(assessment_id)}
+
+@app.get("/api/assessments/{assessment_id}/drift")
+def get_assessment_drift(assessment_id: str) -> dict[str, Any]:
+    sync_assessment_findings(assessment_id)
+    return assessment_exposure_drift(assessment_id)
+
+@app.get("/api/approvals/dashboard")
+def get_approvals_dashboard() -> dict[str, Any]:
+    return approvals_dashboard()
+
+@app.post("/api/assessments")
+def create_assessment(payload: AssessmentCreateRequest) -> dict[str, Any]:
+    target_kind = normalize_target_kind(payload.target_kind)
+    target = validate_target(payload.target, target_kind)
+    risk_mode = normalize_risk_mode(payload.risk_mode)
+    created_at = now_iso()
+    assessment_id = str(uuid.uuid4())
+    workspace = assessment_workspace_path(assessment_id)
+    assessment = {
+        "id": assessment_id,
+        "target": target,
+        "target_kind": target_kind,
+        "assessment_type": payload.assessment_type,
+        "risk_mode": risk_mode,
+        "operator_name": payload.operator_name,
+        "ticket_ref": payload.ticket_ref,
+        "note": payload.note,
+        "status": "ready",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "metadata": {
+            "workspace": workspace,
+            "allowed_subnets": [str(subnet) for subnet in ALLOWED_SUBNETS],
+            "execution_mode": EXECUTION_MODE,
+            "chain_preset": normalize_chain_preset(payload.chain_preset),
+        },
+    }
+    JOB_STORE.create_assessment(assessment)
+    return {"assessment": assessment}
+
+@app.get("/api/assessments/{assessment_id}/workspace")
+def get_assessment_workspace(assessment_id: str) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    return {"workspace": ensure_workspace_artifacts(assessment_id)}
+
+@app.get("/api/assessments/{assessment_id}/workspace/file")
+def get_assessment_workspace_file(assessment_id: str, path: str) -> dict[str, Any]:
+    return {"file": read_workspace_file(assessment_id, path)}
+
+@app.get("/api/assessments/{assessment_id}/evidence")
+def export_assessment_evidence(assessment_id: str) -> JSONResponse:
+    payload = build_assessment_bundle(assessment_id, include_workspace=False)
+    payload["jobs"] = assessment_jobs_resolved(assessment_id)
+    return JSONResponse(content=payload, headers={"Content-Disposition": f'attachment; filename="assessment-evidence-{assessment_id}.json"'})
+
+@app.get("/api/assessments/{assessment_id}/report.md")
+def export_assessment_report_markdown(assessment_id: str) -> PlainTextResponse:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    return PlainTextResponse(content=build_assessment_markdown_report(assessment_id), headers={"Content-Disposition": f'attachment; filename="assessment-report-{assessment_id}.md"'})
+
+@app.get("/api/assessments/{assessment_id}/report.html")
+def export_assessment_report_html(assessment_id: str) -> HTMLResponse:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    return HTMLResponse(content=build_assessment_html_report(assessment_id))
+
+@app.post("/api/assessments/{assessment_id}/approve")
+def approve_assessment_module(assessment_id: str, payload: AssessmentApprovalRequest) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    module = MODULE_BY_ID.get(payload.module_id)
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found")
+    expires_at = str(payload.expires_at or "").strip()
+    parsed_expiry = parse_iso_timestamp(expires_at)
+    if parsed_expiry and parsed_expiry <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Approval expiry harus berada di masa depan")
+    approval = {
+        "id": str(uuid.uuid4()),
+        "assessment_id": assessment_id,
+        "module_id": module.id,
+        "approved_by": payload.approved_by,
+        "ticket_ref": payload.ticket_ref or assessment.get("ticket_ref", ""),
+        "reason": payload.reason,
+        "created_at": now_iso(),
+        "expires_at": parsed_expiry.isoformat() if parsed_expiry else "",
+        "metadata": {
+            "module_title": module.title,
+            "risk_class": module.risk_class,
+            "risk_mode": assessment.get("risk_mode", "safe"),
+        },
+    }
+    JOB_STORE.create_approval(approval)
+    return {"approval": approval}
+
+@app.post("/api/assessments/{assessment_id}/approve-chain")
+def approve_assessment_chain(assessment_id: str, payload: ChainApprovalRequest) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    expires_at = str(payload.expires_at or "").strip()
+    parsed_expiry = parse_iso_timestamp(expires_at)
+    if parsed_expiry and parsed_expiry <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Approval expiry harus berada di masa depan")
+    modules = bulk_approvable_modules(assessment_id, payload.risk_mode, payload.chain_preset)
+    created: list[dict[str, Any]] = []
+    for module in modules:
+      approval = {
+          "id": str(uuid.uuid4()),
+          "assessment_id": assessment_id,
+          "module_id": module.id,
+          "approved_by": payload.approved_by,
+          "ticket_ref": payload.ticket_ref or assessment.get("ticket_ref", ""),
+          "reason": payload.reason,
+          "created_at": now_iso(),
+          "expires_at": parsed_expiry.isoformat() if parsed_expiry else "",
+          "metadata": {
+              "module_title": module.title,
+              "risk_class": module.risk_class,
+              "risk_mode": assessment.get("risk_mode", "safe"),
+              "approval_type": "chain-bulk",
+          },
+      }
+      JOB_STORE.create_approval(approval)
+      created.append(approval)
+    return {"approvals": created, "count": len(created)}
+
+@app.post("/api/assessments/{assessment_id}/approve-destructive")
+def approve_destructive_action(assessment_id: str, payload: DestructiveApprovalRequest) -> dict[str, Any]:
+    assessment = JOB_STORE.get_assessment(assessment_id)
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    action_id = str(payload.action or "").strip()
+    if action_id not in DESTRUCTIVE_ACTIONS:
+        raise HTTPException(status_code=404, detail="Action not found")
+    expires_at = str(payload.expires_at or "").strip()
+    parsed_expiry = parse_iso_timestamp(expires_at)
+    if parsed_expiry and parsed_expiry <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Approval expiry harus berada di masa depan")
+    approval = {
+        "id": str(uuid.uuid4()),
+        "assessment_id": assessment_id,
+        "module_id": destructive_approval_module_id(action_id),
+        "approved_by": payload.approved_by,
+        "ticket_ref": payload.ticket_ref or assessment.get("ticket_ref", ""),
+        "reason": payload.reason,
+        "created_at": now_iso(),
+        "expires_at": parsed_expiry.isoformat() if parsed_expiry else "",
+        "metadata": {
+            "action": action_id,
+            "action_title": DESTRUCTIVE_ACTIONS[action_id]["description"],
+            "approval_type": "destructive",
+            "risk_mode": assessment.get("risk_mode", "safe"),
+            "confirmation_token": destructive_confirmation_token(assessment_id, action_id, str(assessment.get("target") or "")),
+        },
+    }
+    JOB_STORE.create_approval(approval)
+    return {"approval": approval}
+
 @app.get("/api/jobs")
 def list_jobs() -> dict[str, Any]:
     return {"jobs": [reconcile_job_state(job) for job in JOB_STORE.list_jobs()]}
@@ -4423,7 +6336,7 @@ def get_job(job_id: str) -> dict[str, Any]:
     job = reconcile_job_state(JOB_STORE.get_job(job_id))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {"job": job}
+    return {"job": job, "recommendations": recommended_next_modules_for_job(job), "workspace": ensure_workspace_artifacts(str(runtime_meta(job).get("assessment_id"))) if str(runtime_meta(job).get("assessment_id") or "") else None}
 
 @app.post("/api/jobs/{job_id}/stop")
 def stop_job(job_id: str) -> dict[str, Any]:
@@ -4488,41 +6401,90 @@ def export_job_report_html(job_id: str) -> HTMLResponse:
 
 @app.post("/api/imports/parse")
 def import_parse(payload: ImportRequest) -> dict[str, Any]:
-    target = validate_target(payload.target)
+    target_kind = normalize_target_kind(payload.target_kind)
+    target = validate_target(payload.target, target_kind)
     return {"result": parse_import(payload.tool_name, target, payload.content)}
 
 @app.post("/api/jobs")
 def create_module_job(payload: ModuleJobRequest) -> dict[str, Any]:
     if payload.module_id not in MODULE_BY_ID:
         raise HTTPException(status_code=404, detail="Module not found")
-    target = validate_target(payload.target)
+    target_kind = normalize_target_kind(payload.target_kind)
+    target = validate_target(payload.target, target_kind)
     module = MODULE_BY_ID[payload.module_id]
     profile = normalize_execution_profile(payload.execution_profile)
-    job = create_job("module", module.title, target, payload.note, [module.id], profile)
+    risk_mode = normalize_risk_mode(payload.risk_mode)
+    if not module_allowed_in_risk_mode(module, risk_mode):
+        raise HTTPException(status_code=403, detail=f"Module {module.title} is not allowed in risk mode {risk_mode}")
+    if payload.assessment_id:
+        validate_assessment_access(payload.assessment_id, target, risk_mode, target_kind)
+    ensure_module_approval(payload.assessment_id, module, risk_mode)
+    job = create_job(
+        "module",
+        module.title,
+        target,
+        payload.note,
+        [module.id],
+        profile,
+        assessment_id=payload.assessment_id,
+        risk_mode=risk_mode,
+        chain_preset="full-chain-default",
+    )
     return {"job": job}
 
 @app.post("/api/jobs/full-chain")
-def create_full_chain_job(payload: JobRequest) -> dict[str, Any]:
-    target = validate_target(payload.target)
-    chain_modules = [module.id for module in MODULES if module.id != "read-sensitive-file"]
+def create_full_chain_job(payload: ChainJobRequest) -> dict[str, Any]:
+    target_kind = normalize_target_kind(payload.target_kind)
+    target = validate_target(payload.target, target_kind)
     profile = normalize_execution_profile(payload.execution_profile)
-    job = create_job("chain", f"Full Assessment {target}", target, payload.note, chain_modules, profile)
+    chain_preset = normalize_chain_preset(payload.chain_preset)
+    risk_mode = normalize_risk_mode(payload.risk_mode)
+    if payload.assessment_id:
+        validate_assessment_access(payload.assessment_id, target, risk_mode, target_kind)
+    chain_modules = select_chain_modules(risk_mode, chain_preset)
+    if not chain_modules:
+        raise HTTPException(status_code=400, detail="No modules available for selected risk mode")
+    job = create_job(
+        "chain",
+        f"Full Assessment {target}",
+        target,
+        payload.note,
+        chain_modules,
+        profile,
+        assessment_id=payload.assessment_id,
+        risk_mode=risk_mode,
+        chain_preset=chain_preset,
+    )
     return {"job": job}
 
 @app.post("/api/destructive/execute")
 def execute_destructive(payload: DestructiveActionRequest) -> dict[str, Any]:
-    target = validate_target(payload.target)
-    action_def = DESTRUCTIVE_ACTIONS.get(payload.action)
+    if DESTRUCTIVE_MODE != "enabled":
+        raise HTTPException(status_code=403, detail="Destructive mode is disabled by policy")
+    assessment_record = JOB_STORE.get_assessment(payload.assessment_id)
+    target_kind = normalize_target_kind(str((assessment_record or {}).get("target_kind") or "ip"))
+    target = validate_target(payload.target, target_kind)
+    assessment = validate_assessment_access(payload.assessment_id, target, "intrusive", target_kind)
+    action_id = str(payload.action or "").strip()
+    action_def = DESTRUCTIVE_ACTIONS.get(action_id)
     if not action_def:
         raise HTTPException(status_code=404, detail="Action not found")
-    
+    approval = JOB_STORE.get_approval(payload.assessment_id, destructive_approval_module_id(action_id))
+    require_valid_approval_record(approval, "Destructive action requires stored destructive approval before execution")
+    expected_token = destructive_confirmation_token(payload.assessment_id, action_id, target)
+    if str(payload.confirmation_token or "").strip() != expected_token:
+        raise HTTPException(status_code=403, detail="Confirmation token tidak valid untuk destructive action ini")
+
     cmd = action_def["command"].replace("{target}", target)
     result = execute_command_with_progress(cmd, "destructive", target, timeout=300)
-    
+
     return {
         "success": result["success"],
-        "action": payload.action,
+        "action": action_id,
         "target": target,
+        "assessment_id": payload.assessment_id,
+        "approved_by": approval.get("approved_by"),
+        "ticket_ref": approval.get("ticket_ref") or assessment.get("ticket_ref", ""),
         "command": cmd,
         "output": result.get("stdout", "")[:2000]
     }
@@ -4548,6 +6510,134 @@ def check_tool(tool_name: str) -> dict[str, Any]:
     if tool_name not in TOOL_COMMAND_ALIASES:
         raise HTTPException(status_code=404, detail="Tool not found")
     return tool_status(tool_name)
+
+@app.post("/api/tools/execute")
+def execute_tool_command(payload: ToolCommandExecuteRequest) -> dict[str, Any]:
+    tool_name = str(payload.tool_name or "").strip().lower()
+    command = validate_tool_command_request(tool_name, payload.command)
+    timeout = max(5, min(int(payload.timeout or 120), 300))
+    provided_sudo_password = str(payload.sudo_password or "").strip()
+    requires_sudo = command_requires_sudo_password(command)
+    sudo_password = provided_sudo_password or (DEFAULT_SUDO_PASSWORD if requires_sudo else "")
+    should_run_with_sudo = bool(sudo_password and requires_sudo)
+    effective_command = wrap_command_with_sudo_password(command) if should_run_with_sudo else command
+    stdin_text = f"{sudo_password}\n" if should_run_with_sudo else None
+    result = execute_command_with_progress(effective_command, "temp", timeout=timeout, stdin_text=stdin_text)
+    stderr = str(result.get("stderr", ""))
+    sudo_detected = stderr_indicates_sudo_password(stderr)
+    requires_password = sudo_detected and not bool(provided_sudo_password or DEFAULT_SUDO_PASSWORD)
+    return {
+        "tool_name": tool_name,
+        "command": effective_command,
+        "success": bool(result.get("success")),
+        "returncode": int(result.get("returncode", -1)),
+        "stdout": str(result.get("stdout", ""))[:6000],
+        "stderr": stderr[:4000],
+        "cached": bool(result.get("cached")),
+        "requires_sudo_password": requires_password,
+        "command_requires_sudo": requires_sudo or sudo_detected,
+        "sudo_password_source": "user" if provided_sudo_password else ("default" if requires_sudo and DEFAULT_SUDO_PASSWORD else None),
+    }
+
+@app.post("/api/tools/interactive/open")
+def open_interactive_tool_session(payload: InteractiveToolSessionOpenRequest) -> dict[str, Any]:
+    if pty is None:
+        raise HTTPException(status_code=501, detail="Interactive console hanya tersedia di environment Linux container.")
+    tool_name = str(payload.tool_name or "").strip().lower()
+    command = validate_tool_command_request(tool_name, payload.command)
+    if not is_interactive_tool(tool_name, command):
+        raise HTTPException(status_code=400, detail="Tool ini tidak membutuhkan live console interaktif.")
+
+    provided_sudo_password = str(payload.sudo_password or "").strip()
+    requires_sudo = command_requires_sudo_password(command)
+    sudo_password = provided_sudo_password or (DEFAULT_SUDO_PASSWORD if requires_sudo else "")
+    should_run_with_sudo = bool(sudo_password and requires_sudo)
+    effective_command = wrap_command_with_sudo_password(command) if should_run_with_sudo else command
+
+    master_fd, slave_fd = pty.openpty()
+    env = os.environ.copy()
+    env["TERM"] = env.get("TERM", "xterm-256color")
+    process = subprocess.Popen(
+        ["/bin/bash", "-lc", effective_command],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=str(BASE_DIR),
+        env=env,
+        start_new_session=True,
+    )
+    os.close(slave_fd)
+
+    session_id = str(uuid.uuid4())
+    session = {
+        "id": session_id,
+        "tool_name": tool_name,
+        "command": command,
+        "started_command": effective_command,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "status": "running",
+        "exit_code": None,
+        "output": "",
+        "process": process,
+        "master_fd": master_fd,
+    }
+    with INTERACTIVE_SESSION_LOCK:
+        INTERACTIVE_SESSIONS[session_id] = session
+
+    if should_run_with_sudo:
+        try:
+            os.write(master_fd, f"{sudo_password}\n".encode("utf-8", "replace"))
+        except OSError:
+            pass
+
+    reader = threading.Thread(target=interactive_session_reader, args=(session_id,), daemon=True)
+    session["reader"] = reader
+    reader.start()
+    time.sleep(0.35)
+    with INTERACTIVE_SESSION_LOCK:
+        live_session = INTERACTIVE_SESSIONS.get(session_id, session)
+    return {"session": serialize_interactive_session(live_session)}
+
+@app.get("/api/tools/interactive/{session_id}")
+def get_interactive_tool_session(session_id: str) -> dict[str, Any]:
+    with INTERACTIVE_SESSION_LOCK:
+        session = INTERACTIVE_SESSIONS.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Interactive session not found")
+        return {"session": serialize_interactive_session(session)}
+
+@app.post("/api/tools/interactive/{session_id}/input")
+def send_interactive_tool_input(session_id: str, payload: InteractiveToolSessionInputRequest) -> dict[str, Any]:
+    command = str(payload.command or "")
+    if not command.strip():
+        raise HTTPException(status_code=400, detail="Command interaktif tidak boleh kosong.")
+    with INTERACTIVE_SESSION_LOCK:
+        session = INTERACTIVE_SESSIONS.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Interactive session not found")
+        if session.get("status") != "running":
+            raise HTTPException(status_code=400, detail="Interactive session sudah berhenti.")
+        master_fd = session.get("master_fd")
+    if master_fd is None:
+        raise HTTPException(status_code=400, detail="Interactive session tidak lagi menerima input.")
+    try:
+        os.write(master_fd, (command if command.endswith("\n") else f"{command}\n").encode("utf-8", "replace"))
+    except OSError as error:
+        raise HTTPException(status_code=500, detail=f"Gagal mengirim input ke interactive session: {error}") from error
+    time.sleep(0.2)
+    with INTERACTIVE_SESSION_LOCK:
+        session = INTERACTIVE_SESSIONS.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Interactive session not found")
+        return {"session": serialize_interactive_session(session)}
+
+@app.post("/api/tools/interactive/{session_id}/close")
+def close_interactive_tool_session(session_id: str) -> dict[str, Any]:
+    session = close_interactive_session_internal(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Interactive session not found")
+    return {"session": session}
 
 # ============ Main Entry ============
 if __name__ == "__main__":

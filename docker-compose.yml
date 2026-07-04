@@ -12,10 +12,14 @@ services:
       - NET_RAW
     volumes:
       - ./backend/data:/app/backend/data
+      - ./backend/main.py:/app/backend/main.py
       - ./lab-ranges.json:/app/lab-ranges.json
       - ./index.html:/app/index.html
+      - ./login.html:/app/login.html
+      - ./login.css:/app/login.css
       - ./script.js:/app/script.js
       - ./styles.css:/app/styles.css
       - ./logo.png:/app/logo.png
+      - ./favicon.ico:/app/favicon.ico
     environment:
       TZ: Asia/Jakarta
