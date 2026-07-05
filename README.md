@@ -1,4 +1,4 @@
-# Pentest Automation and Network Assessment Hub
+# PANAH - Pentest Automation and Network Assessment Hub
 
 <p align="center">
   <img src="logo.png" alt="Logo PANAH" width="220">
