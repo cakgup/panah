@@ -1,4 +1,4 @@
-# Authorized Lab Emulation Console For Kali Linux Server
+# Pentest Automation and Network Assessment Hub
 
 <p align="center">
   <img src="logo.png" alt="Authorized Lab Emulation Console For Kali Linux Server" width="220">
