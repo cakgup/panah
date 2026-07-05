@@ -1,12 +1,12 @@
 # Pentest Automation and Network Assessment Hub
 
 <p align="center">
-  <img src="logo.png" alt="Authorized Lab Emulation Console For Kali Linux Server" width="220">
+  <img src="logo.png" alt="Logo PANAH" width="220">
 </p>
 
 <p align="center">
-  <strong>Console kerja untuk pentester yang ingin menjalankan dashboard dari server Kali Linux</strong><br>
-  Menyatukan module catalog, live console, timeline, evidence, dan report dalam satu dashboard internal berbasis Docker.
+  <strong>Console kerja untuk assessment teknis, simulasi eksekusi, live console, evidence, dan report dalam satu dashboard internal</strong><br>
+  PANAH dipakai sebagai panel otomasi assessment untuk tim pentest atau lab internal yang ingin menjalankan modul teknis dari host server tanpa memindahkan workflow operator ke terminal sepanjang waktu.
 </p>
 
 <p align="center">
@@ -21,16 +21,17 @@
 
 ## Overview
 
-Repository ini dibuat sebagai console kerja untuk tim pentest internal yang ingin menjalankan aplikasi langsung dari **server Kali Linux**, tanpa bergantung pada WSL.
+Repository ini dibuat sebagai console kerja untuk tim pentest internal yang ingin menjalankan asesmen teknis dari server lab secara terpusat.
 
 Tujuan utamanya:
 
-- memberi antarmuka yang lebih rapi untuk menjalankan asesmen lab yang terotorisasi;
-- membatasi target ke subnet yang disetujui;
-- merangkum hasil scan menjadi evidence, timeline, severity, dan report;
-- memudahkan operator membuka dashboard dari browser mesin lain di jaringan internal.
+- menyediakan antarmuka yang lebih rapi untuk menjalankan asesmen teknis;
+- membatasi target ke range yang memang diizinkan;
+- menampilkan hasil ke dalam live console, timeline, evidence, dan report;
+- memudahkan operator membuka dashboard dari browser mesin lain di jaringan internal;
+- menjaga assessment tetap berada dalam guardrail backend, bukan shell bebas dari browser.
 
-Repo ini bukan shell bebas untuk menjalankan command arbitrer dari UI. Semua alur tetap berada dalam guardrail backend.
+PANAH berperan pada sisi assessment teknis. Jika temuan sudah perlu orkestrasi operasional atau ticketing formal, alurnya dapat dilanjutkan ke SATRIA dan PERISAI.
 
 ---
 
@@ -45,35 +46,78 @@ Console ini cocok untuk:
 
 ---
 
-## Konsep Kerja
+## Posisi Dalam Ekosistem
 
-Alur kerja repo ini sederhana:
+Dalam ekosistem kerja SITP saat ini:
 
-1. source code di-clone ke server Kali Linux;
-2. aplikasi dibangun dan dijalankan dengan Docker Compose;
-3. container menjalankan backend FastAPI dan tool yang ada di image;
-4. operator membuka dashboard dari browser ke IP server;
-5. output modul diproses menjadi:
-   - live console
-   - module timeline
-   - evidence highlights
-   - severity summary
-   - report
+- `PANAH` berfokus pada assessment teknis dan otomasi simulasi.
+- `SATRIA` berfokus pada registrasi aset, orkestrasi scan, gate decision, dan ticket publish.
+- `PERISAI` atau IRIS berfokus pada case management, task, evidence, dan investigasi insiden.
 
-Dengan pola ini, server Kali dipakai sebagai execution environment, sedangkan browser operator dipakai untuk UI dan review hasil.
+Dengan pola ini, PANAH menjadi sumber awal assessment teknis sebelum hasilnya diolah lebih lanjut di layer operasional.
 
 ---
 
 ## Fitur Utama
 
-- Guardrail target berdasarkan approved ranges atau subnet yang diizinkan.
-- Module catalog berbasis fase kill chain.
+- Guardrail target berbasis approved ranges atau subnet yang diizinkan.
+- Module catalog berbasis fase kill chain atau kategori assessment.
 - Full simulation chain sesuai execution profile.
 - Live Console, Timeline, dan Evidence dalam panel terpisah.
 - Severity summary yang mengikuti evidence yang benar-benar ditampilkan.
-- View Report untuk membuka report dari job aktif.
-- Perlindungan password untuk aksi `Simpan Ranges`.
-- Build ulang cukup dari source repo dengan `docker compose up --build`.
+- Report view untuk membuka ringkasan hasil job aktif.
+- Panel recent jobs untuk review job terakhir.
+- Approved ranges editor dengan proteksi password.
+- Tampilan login dummy dan header branding yang diselaraskan dengan ekosistem SITP.
+
+---
+
+## Menu dan Panel Operasional
+
+- `Target`
+  Operator mengisi target utama seperti IP, host, atau domain sesuai jenis assessment.
+
+- `Target Kind`
+  Menentukan kategori target, misalnya `ip` atau jenis lain sesuai modul yang aktif.
+
+- `Module Profile`
+  Menentukan kedalaman eksekusi seperti `fast`, `balanced`, atau `deep`.
+
+- `Run Full Simulation Chain`
+  Menjalankan alur asesmen berantai sesuai profile yang dipilih.
+
+- `Advanced Settings`
+  Menyediakan approved ranges dan guardrail tambahan untuk eksekusi harian.
+
+- `Module Catalog`
+  Menampilkan modul assessment, deskripsi singkat, dan command preview.
+
+- `Recent Jobs`
+  Menampilkan job terkini beserta tombol lihat hasil, hapus, atau review.
+
+- `Console`
+  Menampilkan output teknis real time dari job yang sedang dipilih.
+
+- `Evidence`
+  Menampilkan highlight hasil penting yang bisa dipakai untuk review cepat.
+
+- `Report`
+  Menampilkan hasil ringkas dalam format yang lebih nyaman dibaca operator atau reviewer.
+
+---
+
+## Konsep Kerja
+
+Alur kerja PANAH dirancang sederhana:
+
+1. source code di-clone ke server lab;
+2. aplikasi dibangun dan dijalankan dengan Docker Compose;
+3. backend FastAPI menjalankan workflow assessment yang sudah disetujui;
+4. operator membuka dashboard dari browser;
+5. job dieksekusi di host server;
+6. output dikonversi menjadi console, timeline, evidence, severity, dan report.
+
+Dengan pola ini, server lab dipakai sebagai execution environment, sedangkan browser operator dipakai untuk UI dan review hasil.
 
 ---
 
@@ -110,7 +154,7 @@ Ringkasnya:
 - `backend/store.py` menangani penyimpanan job.
 - `backend/lab_config.py` mengelola konfigurasi approved ranges.
 - `index.html`, `script.js`, dan `styles.css` menangani UI dashboard.
-- `Dockerfile` menyusun image Kali Linux beserta dependency yang dibutuhkan modul.
+- `Dockerfile` menyusun image beserta dependency yang dibutuhkan modul.
 - `docker-compose.yml` menjadi jalur utama agar user lain cukup build dan start dari repo.
 
 ---
@@ -137,14 +181,14 @@ newgrp docker
 Catatan:
 
 - setelah `usermod -aG docker $USER`, login ulang biasanya membantu jika group belum terbaca;
-- port default aplikasi adalah `4080`;
-- jika server memakai firewall, buka port `4080/tcp` bila dashboard perlu diakses dari mesin lain.
+- port default lokal repo ini adalah `4080`;
+- pada deployment terpusat, port dapat dipetakan berbeda sesuai kebutuhan lingkungan.
 
 ---
 
 ## Quick Start
 
-Di server Kali Linux:
+Di server tujuan:
 
 ```bash
 git clone <URL-REPO-GITHUB-ANDA>
@@ -156,10 +200,10 @@ docker compose ps
 Lalu akses dari browser:
 
 ```text
-http://IP_SERVER_KALI:4080
+http://IP_SERVER:4080
 ```
 
-Contoh:
+Contoh lokal:
 
 ```text
 http://localhost:4080
@@ -168,8 +212,6 @@ http://localhost:4080
 ---
 
 ## Menjalankan Console
-
-Perintah utama yang paling sering dipakai:
 
 Build dan start:
 
@@ -201,14 +243,6 @@ Start ulang tanpa rebuild:
 docker compose up -d
 ```
 
-Rebuild penuh lagi biasanya hanya diperlukan jika:
-
-- `Dockerfile` berubah;
-- dependency Python berubah;
-- ada perubahan tool yang di-install di image.
-
-Kalau hanya mengubah file UI atau source backend, Anda tetap bisa memakai `docker compose up -d --build` agar hasilnya konsisten untuk operator lain.
-
 ---
 
 ## Workflow Penggunaan
@@ -217,17 +251,18 @@ Urutan pakai yang disarankan:
 
 1. pastikan container sudah aktif;
 2. buka dashboard dari browser ke IP server;
-3. isi target IP yang berada dalam approved ranges;
+3. isi target yang berada dalam approved ranges;
 4. pilih `Module Profile`:
    - `fast` untuk validasi cepat;
-   - `balanced` untuk baseline yang lebih umum;
+   - `balanced` untuk baseline umum;
    - `deep` untuk observasi lebih lengkap;
 5. jalankan modul tunggal atau full chain;
-6. pantau hasil di tab:
+6. pantau hasil di:
    - `Console`
    - `Timeline`
    - `Evidence`
-7. buka report jika ingin melihat ringkasan hasil yang lebih rapi.
+   - `Report`
+7. bila hasil perlu diteruskan secara operasional, gunakan SATRIA sebagai layer berikutnya.
 
 ---
 
@@ -271,16 +306,16 @@ Catatan:
 
 ## Modul dan Tooling
 
-Repo ini dirancang untuk memetakan output tool menjadi evidence yang lebih mudah dibaca operator. Beberapa area modul yang sudah ada:
+Repo ini dirancang untuk memetakan output tool menjadi evidence yang lebih mudah dibaca operator. Area modul yang sudah disiapkan antara lain:
 
-- service discovery
-- web fingerprinting
-- web security header audit
-- content discovery
-- TLS dan DNS baseline review
-- workflow evidence dan timeline
+- service discovery;
+- web fingerprinting;
+- web security header audit;
+- content discovery;
+- TLS dan DNS baseline review;
+- workflow evidence dan timeline.
 
-Image Docker akan meng-install beberapa tool penting seperti:
+Image Docker dapat meng-install tool penting seperti:
 
 - `nmap`
 - `ffuf`
@@ -298,13 +333,11 @@ Image Docker akan meng-install beberapa tool penting seperti:
 - `httpx`
 - `nuclei`
 
-Repo ini tetap bisa hidup walau sebagian target tidak merespons atau sebagian modul menghasilkan evidence yang ringan.
-
 ---
 
 ## Verifikasi Yang Sudah Dicek
 
-Sebelum README ini dirapikan, repo ini sudah diuji dengan skenario setara user lain yang baru download source ke folder baru:
+Skenario yang pernah diverifikasi untuk memastikan repo ini bisa dipindahkan ke host lain:
 
 1. salin repo ke direktori bersih;
 2. jalankan `docker compose build --no-cache`;
@@ -319,8 +352,6 @@ Hasil verifikasi:
 - endpoint aplikasi merespons `200`;
 - folder `backend/data/` otomatis terisi database saat aplikasi hidup.
 
-Artinya, secara praktis repo ini sudah siap dipakai user lain yang clone dari GitHub lalu menjalankan `docker compose up -d --build`.
-
 ---
 
 ## Troubleshooting Singkat
@@ -330,8 +361,8 @@ Jika dashboard tidak terbuka:
 - cek `docker compose ps`;
 - cek `docker compose logs -f`;
 - pastikan port `4080` tidak dipakai service lain;
-- pastikan firewall server mengizinkan akses ke port `4080`;
-- cek apakah Anda membuka `http://IP_SERVER_KALI:4080`, bukan `localhost`, jika akses dilakukan dari laptop lain.
+- pastikan firewall server mengizinkan akses ke port yang dipakai;
+- cek apakah Anda membuka `http://IP_SERVER:4080`, bukan `localhost`, jika akses dilakukan dari mesin lain.
 
 Jika build gagal:
 
@@ -352,7 +383,7 @@ Jika modul tidak menghasilkan data yang lengkap:
 - Gunakan repo ini hanya untuk lab yang telah diotorisasi.
 - Jangan memperluas target di luar approved ranges tanpa persetujuan yang jelas.
 - Jangan menganggap UI ini sebagai pengganti analisis manual; ini adalah akselerator workflow.
-- Simpan pengembangan modul dengan pendekatan yang bertanggung jawab dan terukur.
+- Bila hasil assessment perlu ditindaklanjuti secara formal, pindahkan orkestrasi dan ticketing ke SATRIA serta PERISAI.
 
 ---
 
