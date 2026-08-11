@@ -11,6 +11,15 @@ WORKDIR /app
 
 SHELL ["/bin/bash", "-lc"]
 
+RUN printf '%s\n' \
+    'Acquire::Retries "5";' \
+    'Acquire::http::Timeout "30";' \
+    'Acquire::https::Timeout "30";' \
+    > /etc/apt/apt.conf.d/99codex-retries \
+    && printf '%s\n' \
+    'deb http://kali.download/kali kali-rolling main contrib non-free non-free-firmware' \
+    > /etc/apt/sources.list
+
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update \
